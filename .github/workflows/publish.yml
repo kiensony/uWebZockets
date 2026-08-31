@@ -1,0 +1,171 @@
+name: Publish
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    environment: Publish
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-linux-gnu
+            flake_package: release
+          - runner: ubuntu-24.04
+            target: x86_64-linux-musl
+            flake_package: musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-linux-gnu
+            flake_package: release
+          - runner: ubuntu-24.04-arm
+            target: aarch64-linux-musl
+            flake_package: musl
+          - runner: macos-15-intel
+            target: x86_64-macos
+            flake_package: release
+          - runner: macos-15
+            target: aarch64-macos
+            flake_package: release
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Validate release metadata
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          manifest_version=$(sed -n 's/^[[:space:]]*\.version = "\([^"]*\)",/\1/p' build.zig.zon)
+          test -n "$version"
+          printf '%s\n' "$version" | grep -Eq \
+            '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+          test "$version" = "$manifest_version"
+          grep -F "## [$version]" CHANGELOG.md
+
+      - name: Build static library
+        shell: bash
+        run: |
+          nix build "path:.#${{ matrix.flake_package }}" \
+            --out-link "result-${{ matrix.target }}"
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          archive_root="$RUNNER_TEMP/uWebZockets-${{ matrix.target }}"
+          mkdir -p "$archive_root/lib"
+          cp "result-${{ matrix.target }}"/lib/*.a "$archive_root/lib/"
+          cp CHANGELOG.md LICENSE README.md THIRD_PARTY_NOTICES.md build.zig.zon "$archive_root/"
+          cp -R licenses "$archive_root/"
+          mkdir -p "$archive_root/licenses/vendor"
+          cp vendor/boringssl/LICENSE "$archive_root/licenses/vendor/boringssl_license.txt"
+          cp vendor/libdeflate/COPYING "$archive_root/licenses/vendor/libdeflate_license.txt"
+          cp vendor/lsquic/LICENSE "$archive_root/licenses/vendor/lsquic_license.txt"
+          cp vendor/lsquic/LICENSE.chrome "$archive_root/licenses/vendor/lsquic_chrome_license.txt"
+          tar -C "$RUNNER_TEMP" -czf "uWebZockets-${{ matrix.target }}.tar.gz" \
+            "uWebZockets-${{ matrix.target }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: uwebzockets-${{ matrix.target }}
+          path: uWebZockets-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Create GitHub release
+    needs:
+      - build
+    runs-on: ubuntu-24.04
+    environment: Publish
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Prepare release
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          artifact_count=$(find artifacts -maxdepth 1 -name '*.tar.gz' | wc -l)
+          test "$artifact_count" -eq 6
+          (
+            cd artifacts
+            sha256sum ./*.tar.gz >SHA256SUMS
+          )
+          awk -v version="$version" '
+            index($0, "## [" version "]") == 1 {
+              found = 1
+              next
+            }
+            found && /^## \[/ {
+              exit
+            }
+            found {
+              print
+            }
+            END {
+              if (!found) exit 1
+            }
+          ' CHANGELOG.md >release_notes.md
+
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          release_flags=()
+          case "$version" in
+            *-*)
+              release_flags+=(--prerelease)
+              ;;
+            *)
+              release_flags+=(--latest)
+              ;;
+          esac
+
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --notes-file release_notes.md \
+              "${release_flags[@]}"
+            gh release upload "$GITHUB_REF_NAME" \
+              artifacts/*.tar.gz artifacts/SHA256SUMS --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              artifacts/*.tar.gz artifacts/SHA256SUMS \
+              --verify-tag \
+              --title "$GITHUB_REF_NAME" \
+              --notes-file release_notes.md \
+              "${release_flags[@]}"
+          fi

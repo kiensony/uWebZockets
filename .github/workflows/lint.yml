@@ -4,28 +4,21 @@ on:
   push:
     branches:
       - main
-    paths:
-      - "**.zig"
-      - "**.zon"
-      - "build.zig"
   pull_request:
     branches:
       - main
-    paths:
-      - "**.zig"
-      - "**.zon"
-      - "build.zig"
+  workflow_dispatch:
 
 jobs:
   fmt:
     name: Check Zig Formatting
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: Linting
     permissions:
       contents: read
 
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v7
 
       - name: Setup Zig
@@ -34,4 +27,7 @@ jobs:
           version: 0.16.0
 
       - name: Run Zig fmt
-        run: zig fmt --check .
+        run: zig fmt --check build.zig src examples tests
+
+      - name: Check repository conventions
+        run: sh scripts/check_conventions.sh

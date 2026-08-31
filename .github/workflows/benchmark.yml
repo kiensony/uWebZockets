@@ -1,0 +1,120 @@
+name: Benchmark
+
+on:
+  pull_request:
+    branches:
+      - main
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    name: HTTP throughput regression
+    runs-on: ubuntu-24.04
+    environment: Benchmarking
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout candidate
+        uses: actions/checkout@v7
+        with:
+          path: candidate
+          submodules: recursive
+
+      - name: Checkout main baseline
+        uses: actions/checkout@v7
+        with:
+          path: baseline
+          ref: ${{ github.event.pull_request.base.sha || 'main' }}
+          submodules: recursive
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Build candidate
+        working-directory: candidate
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if nix develop "path:." -c zig build \
+              -Doptimize=ReleaseFast \
+              --prefix "$RUNNER_TEMP/candidate"; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            retry_delay=$((attempt * 10))
+            printf 'Candidate build attempt %s failed; retrying in %s seconds\n' \
+              "$attempt" "$retry_delay"
+            sleep "$retry_delay"
+          done
+
+      - name: Build baseline
+        working-directory: baseline
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if nix develop "path:." -c zig build \
+              -Doptimize=ReleaseFast \
+              --prefix "$RUNNER_TEMP/baseline"; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            retry_delay=$((attempt * 10))
+            printf 'Baseline build attempt %s failed; retrying in %s seconds\n' \
+              "$attempt" "$retry_delay"
+            sleep "$retry_delay"
+          done
+
+      - name: Compare HTTP throughput
+        id: benchmark
+        shell: bash
+        run: |
+          set -euo pipefail
+          result_directory="$RUNNER_TEMP/benchmark-results"
+          candidate_rate=$(
+            nix develop "path:./candidate" -c sh candidate/scripts/benchmark_http.sh \
+              candidate "$RUNNER_TEMP/candidate/bin/hello_world" "$result_directory"
+          )
+          baseline_rate=$(
+            nix develop "path:./candidate" -c sh candidate/scripts/benchmark_http.sh \
+              baseline "$RUNNER_TEMP/baseline/bin/hello_world" "$result_directory"
+          )
+          minimum_rate=$(awk -v baseline="$baseline_rate" 'BEGIN { printf "%.2f", baseline * 0.90 }')
+
+          {
+            printf '%s\n' '## HTTP throughput benchmark'
+            printf '\n| Revision | Median requests/second |\n'
+            printf '| --- | ---: |\n'
+            printf '| Candidate | %s |\n' "$candidate_rate"
+            printf '| Main baseline | %s |\n' "$baseline_rate"
+            printf '\nCandidate gate: at least 90%% of baseline (%s requests/second).\n' "$minimum_rate"
+          } | tee "$RUNNER_TEMP/benchmark-summary.md" >>"$GITHUB_STEP_SUMMARY"
+
+          awk -v candidate="$candidate_rate" -v baseline="$baseline_rate" \
+            'BEGIN { exit !(baseline > 0 && candidate >= baseline * 0.90) }'
+
+      - name: Upload benchmark results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: http-throughput-benchmark
+          path: |
+            ${{ runner.temp }}/benchmark-results/
+            ${{ runner.temp }}/benchmark-summary.md
+          if-no-files-found: error
+          retention-days: 30

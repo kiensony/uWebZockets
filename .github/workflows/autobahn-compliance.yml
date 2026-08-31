@@ -1,0 +1,67 @@
+name: Autobahn Compliance
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  compliance:
+    name: RFC 6455 compliance
+    runs-on: ubuntu-24.04
+    environment: "autobahn Compliance"
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Setup Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.9.4
+
+      - name: Build compliance server
+        run: nix develop "path:." -c zig build -Doptimize=ReleaseSafe
+
+      - name: Run Autobahn Testsuite
+        shell: bash
+        run: |
+          deno run \
+            --no-prompt \
+            --allow-net=127.0.0.1:9001 \
+            --allow-read=tests/autobahn,zig-out/bin \
+            --allow-run=docker,zig-out/bin/autobahn_server \
+            --allow-write=tests/autobahn/reports \
+            tests/autobahn/server_test.js \
+            2>&1 | tee "$RUNNER_TEMP/autobahn_test.log"
+
+      - name: Upload compliance report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: autobahn-compliance-report
+          path: |
+            tests/autobahn/reports/
+            ${{ runner.temp }}/autobahn_test.log
+          if-no-files-found: error
+          retention-days: 30

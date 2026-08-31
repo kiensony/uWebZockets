@@ -1,67 +1,165 @@
 # µWebZockets CI/CD Pipeline
 
-This document outlines the Continuous Integration and Continuous Deployment (CI/CD) strategy for `µWebZockets`. Given our strict performance and functional paradigms, the pipeline acts as the ultimate gatekeeper for zero-allocations, memory safety, and protocol compliance.
+The pipeline verifies formatting, bounded protocol behavior, multiple
+optimization modes, standards compliance, cross-target compilation, and
+release metadata. A passing pipeline is evidence for the tested configurations;
+it is not a proof that all memory or security defects are absent.
 
 ## Workflows
 
-The following table maps our CI/CD strategy to specific GitHub Actions workflow files:
+| Workflow | Trigger | Environment | Purpose |
+| --- | --- | --- | --- |
+| `lint.yml` | pushes and pull requests to `main`, manual | `Linting` | Zig formatting and repository conventions |
+| `test.yml` | pushes and pull requests to `main`, manual | `Testing` | Debug, sanitizer, fuzz, ReleaseSafe, and ReleaseFast verification |
+| `autobahn-compliance.yml` | pushes and pull requests to `main`, manual | `autobahn Compliance` | RFC 6455 server compliance |
+| `h1spec-compliance.yml` | pushes and pull requests to `main`, manual | `h1spec Compliance` | HTTP/1.1 compliance |
+| `benchmark.yml` | pull requests to `main`, nightly, manual | `Benchmarking` | HTTP throughput regression |
+| `publish.yml` | `v*` tag push | `Publish` | Six-target static-library release |
 
-| Workflow                          | Trigger                             | Purpose                                         |
-| --------------------------------- | ----------------------------------- | ----------------------------------------------- |
-| `.github/workflows/lint.yml`      | Pull request into `main`            | Code formatting (`zig fmt --check .`) and convention checks (emoji/`snake_case` scanner). |
-| `.github/workflows/test.yml`      | Pull request into `main`            | Native Zig unit tests (`zig build test`) with `std.testing.allocator` memory leak detection. |
-| `.github/workflows/autobahn-compliance.yml`| Pull request into `main`            | Spins up target servers and runs Autobahn WS test suite. |
-| `.github/workflows/h1spec-compliance.yml`| Pull request into `main`           | Spins up target server and runs `h1spec` HTTP/1.1 test suite via Nix and Deno. |
-| `.github/workflows/publish.yml`   | Push of a version tag matching `v*` | Cross-platform builds (Linux/macOS) via Nix and GitHub release binary distribution. |
+Every workflow uses a GitHub environment so repository deployments and any
+environment protection rules remain visible in GitHub.
 
-## Pipeline Stages
+## Lint
 
-### 1. Formatting & Linting (`zig fmt` & Custom Checks)
-- **`zig fmt` Check**: Ensures all source code adheres strictly to the Zig formatter. Any unformatted code will fail the build.
-- **Convention Checks**: A custom CI script will scan for banned patterns based on our `CODING_CONVENTION.md`:
-  - **Emojis**: Scans for and rejects any emojis in code, comments, or commit messages.
-  - **Naming**: Enforces Linux file naming (`snake_case`), as well as `snake_case` for functions and variables (our Linux style override).
+The lint job uses Zig 0.16.0 and runs:
 
-### 2. Unit Testing & Memory Leak Detection (`zig build test`)
-- **Execution**: Runs all internal `test` blocks defined across the `src/` directory.
-- **Memory Safety**: Zig's `std.testing.allocator` is used for all tests. If any test leaks even a single byte of memory, or if a double-free/use-after-free is detected, the pipeline will immediately halt and fail.
-- **Fuzz Testing**: Executes built-in Zig fuzz tests targeting our integration with the `zslay` parser to ensure absolute resilience against malformed HTTP/WS payloads.
+```sh
+zig fmt --check build.zig src examples tests
+sh scripts/check_conventions.sh
+```
 
-### 3. Build Verification (`ReleaseSafe` & `ReleaseFast`)
-- **Compilation Check**: Ensures that the library, target servers in `tests/`, and sample apps in `examples/` compile successfully across different optimization modes.
-  - **`ReleaseSafe`**: Compiled with optimizations enabled but safety checks (bounds checking, overflow) retained. Used to catch hidden memory bugs under load.
-  - **`ReleaseFast`**: Compiled with max speed, stripping safety checks. The ultimate production target for our zero-alloc hot paths.
-- **Cross-Compilation Check**: Validates that `µWebZockets` cross-compiles flawlessly for critical target triples (e.g., `x86_64-linux-musl`, `aarch64-linux-gnu`, `aarch64-macos-none`) via Nix.
+The convention scanner checks project source filenames, Zig function and
+variable names, and text files for prohibited emoji code points. Vendored
+sources are excluded because their upstream conventions are preserved.
 
-### 4. Protocol Compliance Testing (Autobahn & h1spec)
-To position `µWebZockets` as a commercial-grade alternative to `µWebSockets`, we must perfectly pass industry-standard protocol test suites.
-- **Autobahn WebSockets Testsuite**:
-  - *Action*: The pipeline spins up our `tests/autobahn/` target server in the background and runs the standard Python `wstest` docker container against it.
-  - *Purpose*: Validates 100% strict compliance with RFC-6455 (WebSocket Protocol), including fragmentation, masking, per-message deflate, and control frames.
-- **h1spec (HTTP/1.1 Testsuite)** (via `h1spec-compliance.yml`):
-  - *Action*: The pipeline compiles our `tests/h1spec/` target server and runs the `h1spec` suite against it utilizing Deno and Nix.
-  - *Purpose*: Validates HTTP/1.1 edge cases, pipelining, chunked encoding, and malformed request handling to ensure our zero-alloc HTTP FSM parser never panics or hangs.
+## Unit and build verification
 
-### 5. Performance Benchmarking (Nightly/PRs)
-- **Action**: Runs load testing tools (like `wrk` or `bombardier`) against the current branch and compares the request-per-second (RPS) and latency percentiles against both the `main` branch and a baseline C++ `µWebSockets` server.
-- **Purpose**: Ensures that new commits do not introduce hidden performance regressions, cache misses, or violate the Data-Oriented Design (DoD) zero-allocation hot-path rules.
+The test job checks out all submodules and enters the Nix development shell.
+It then runs:
 
-### 6. Job: `publish-artifacts`
-1. Checkout repository.
-2. Setup Nix (with `flake-parts`) and Zig 0.16.0.
-3. Derives the version from the tag (`v0.1.0` becomes `0.1.0`).
-4. Extracts the release notes from the matching `## [0.1.0]` section of `CHANGELOG.md`.
-5. Calls `nix build` sequentially for the targets defined in `flake.nix`:
-   - `linux-x86_64-gnu` -> builds `uWebZockets-x86_64-linux-gnu.a`
-   - `linux-x86_64-musl` -> builds `uWebZockets-x86_64-linux-musl.a`
-   - `linux-aarch64-gnu` -> builds `uWebZockets-aarch64-linux-gnu.a`
-   - `linux-aarch64-musl` -> builds `uWebZockets-aarch64-linux-musl.a`
-   - `macos-x86_64` -> builds `uWebZockets-x86_64-macos.a`
-   - `macos-aarch64` -> builds `uWebZockets-aarch64-macos.a`
-   - `windows-x86_64` -> builds `uWebZockets-x86_64-windows.lib`
-6. Packages Linux and macOS artifacts exclusively into cross-platform archives (`.tar.bz2`, `.tar.gz`, `.tar.xz`) utilizing hermetic tools (`gnutar`, `bzip2`, `gzip`, `xz`). Windows targets are packaged into `.zip` archives utilizing the `zip` tool. All tools are provided via `flake.nix` dev shells. The raw `.a`/`.lib` files are strictly omitted from the payload.
-7. Creates (or updates) the GitHub Release named after the tag and uploads the generated tarball archives.
+```sh
+zig build test --summary all
+zig build test -Dsanitize=true -Doptimize=ReleaseSafe --summary all
+zig build test-compile -Doptimize=ReleaseSafe --summary all
+zig build fuzz --fuzz=100K -Doptimize=ReleaseSafe
+zig build lib -Doptimize=ReleaseFast --summary all
+```
 
-## Versioning Rules
-- Semantic versioning; the `v*` tag is the single release trigger.
-- The tag must match the version declared in `build.zig.zon`, and a matching `CHANGELOG.md` section must exist. The full checklist lives in [CONTRIBUTE.md](CONTRIBUTE.md).
+Debug tests cover parser limits, malformed framing, partial reads and writes,
+pool ownership, router method behavior, handshake validation, close codes,
+fragmentation, streaming UTF-8, SIMD masking, pub/sub cleanup, and large
+WebSocket messages. Code that allocates in tests uses leak-detecting test
+allocators where applicable. Most hot-path tests use caller-provided fixed
+storage and therefore allocate nothing to begin with.
+
+ReleaseSafe compiles the same test graph with safety checks and optimization.
+ReleaseFast proves the production static-library graph and all vendored C/C++
+dependencies compile at the speed-oriented mode.
+
+The sanitizer pass is native Linux only. The Nix shell supplies matching LLVM
+sanitizer, glibc, and dynamic-linker paths. `build.zig` sets coherent RPATHs
+and launches sanitizer executables through that matching loader, instruments
+BoringSSL, lsquic, libdeflate, and the local C ABI shim with ASan/UBSan, enables
+Zig's full C-UB checks, preserves frame pointers, and isolates the vendor cache.
+CI enables ASan leak detection and makes both ASan and UBSan fail fast.
+
+The test job also runs Zig's native fuzzer for 100,000 iterations over bounded
+HTTP, HTTP/3 metadata, WebSocket extension, and zslay receive-state targets.
+Seed corpora include valid, fragmented, malformed, and control-frame inputs.
+
+## Autobahn WebSockets compliance
+
+The Autobahn job builds `autobahn_server` in ReleaseSafe, then the Deno runner
+starts it, waits until port 9001 is accepting connections, and launches the
+digest-pinned
+`crossbario/autobahn-testsuite:0.8.2@sha256:519915fb568b04c9383f70a1c405ae3ff44ab9e35835b085239c258b6fac3074`
+container as a fuzzing client. The runner uses Deno's native process API and
+has no runtime JavaScript dependencies. It always terminates the server, and
+the container writes reports as the invoking POSIX user so repeated local runs
+can replace them safely. The workflow uploads the complete HTML/JSON report
+even when the gate fails.
+
+The configuration selects groups 1-7, 9-13 with no exclusions. The report
+gate permits `OK`, `INFORMATIONAL`, and `NON-STRICT` for both protocol and close
+behavior; every other outcome fails the job.
+
+The verified alpha baseline covers all 517 cases with 514 `OK` and 3
+`INFORMATIONAL` results for both protocol and close behavior. RFC 7692 groups
+12 and 13 pass through negotiated no-context-takeover per-message deflate; no
+case is excluded or suppressed.
+
+## h1spec compliance
+
+The h1spec job builds the HTTP target in ReleaseSafe, waits for port 8000, and
+runs the pinned repository submodule with Deno. On failure it uploads the
+server log. Deterministic HTTP adversarial cases also remain in the Zig unit
+suite so malformed-input coverage does not depend solely on an external tool.
+
+## Cross-target checks
+
+`flake.nix` defines native GNU or macOS packages and Linux musl packages. Its
+Nixpkgs input is pinned to the 26.05 release so all four supported host systems,
+including x86_64-darwin, remain evaluable. Checks compile tests for both native
+and musl targets without attempting to execute foreign binaries. The publish
+matrix runs natively on these GitHub-hosted architectures:
+
+- x86_64-linux-gnu
+- x86_64-linux-musl
+- aarch64-linux-gnu
+- aarch64-linux-musl
+- x86_64-macos
+- aarch64-macos
+
+Windows is not supported in `1.0.0-alpha` and is intentionally absent from the
+matrix.
+
+The default build also compiles the bounded `http3_server` example, and inline
+tests cover QPACK header validation and HTTP/3 framing. A cross-implementation
+HTTP/3 compliance job is not yet part of the alpha gate.
+
+## Performance regression
+
+The benchmark workflow checks the pull request and its `main` base out into
+separate directories, then builds each checkout from its own working directory
+with ReleaseFast on the same Ubuntu runner. Candidate and baseline builds use
+three bounded attempts with 10- and 20-second backoff so a transient immutable
+dependency fetch does not discard the comparison. The workflow runs three
+10-second `wrk` samples against each `hello_world` server, compares median
+requests per second, and fails when the candidate falls below 90 percent of the
+baseline. Raw latency and throughput reports are retained for 30 days. The
+tolerance accounts for shared-runner variance; benchmark results are regression
+evidence, not a portable capacity claim.
+
+## Publishing
+
+A `v*` tag starts two stages.
+
+1. Each matrix job enters the `Publish` environment, checks that the tag
+   is valid Semantic Versioning, equals `build.zig.zon`'s version, and has a
+   matching `CHANGELOG.md` section, then builds the appropriate Nix package.
+2. Each target is packaged as one `.tar.gz` containing the µWebZockets,
+   BoringSSL, lsquic, and libdeflate static archives, metadata, and all relevant
+   licenses.
+3. The release job enters the `Publish` environment, requires exactly six
+   archives, writes `SHA256SUMS`, extracts matching changelog notes, and creates
+   or updates the GitHub release through `gh`.
+4. Versions containing a hyphen, including `1.0.0-alpha`, are marked as
+   prereleases. Stable versions are marked latest.
+
+Release uploads are idempotent: rerunning a tag workflow updates notes and
+replaces assets with the same names.
+
+## Release checklist
+
+- Update `build.zig.zon`, `flake.nix`, and `CHANGELOG.md` to the same version.
+- Run formatting and convention checks.
+- Run Debug tests and ReleaseSafe/ReleaseFast build checks.
+- Run the native Linux ASan/UBSan/LeakSanitizer pass.
+- Run Autobahn and h1spec compliance.
+- Verify third-party revisions and licenses.
+- Create and push `v<version>` only after the release commit is final.
+- Review the `Publish` environment deployment and generated checksums.
+
+The benchmark workflow is advisory for release tags because it runs on pull
+requests and nightly rather than on `publish.yml`. Performance claims must cite
+the retained configuration and raw results.

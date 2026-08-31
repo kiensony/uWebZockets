@@ -1,2 +1,6 @@
 #!/usr/bin/env sh
-exec zig c++ "$@"
+uwebzockets_zig=${UWEBZOCKETS_ZIG:-zig}
+if [ -n "${UWEBZOCKETS_TARGET:-}" ]; then
+    exec "$uwebzockets_zig" c++ -target "$UWEBZOCKETS_TARGET" "$@"
+fi
+exec "$uwebzockets_zig" c++ "$@"

@@ -15,6 +15,7 @@ zig-pkg/
 *.so
 result
 result-*
+tests/autobahn/reports/
 
 # os / editors
 .DS_Store

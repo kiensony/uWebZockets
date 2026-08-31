@@ -1,4 +1,4 @@
-name: h1spec-compliance
+name: h1spec Compliance
 
 on:
   push:
@@ -7,11 +7,20 @@ on:
   pull_request:
     branches:
       - main
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: "h1spec Compliance"
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
         with:
@@ -20,17 +29,54 @@ jobs:
       - name: Install Nix
         uses: cachix/install-nix-action@v31
         with:
-          nix_path: nixpkgs=channel:nixos-unstable
+          extra_nix_config: |
+            experimental-features = nix-command flakes
 
       - name: Setup Deno
         uses: denoland/setup-deno@v2
         with:
-          deno-version: v2.x
+          deno-version: v2.9.4
 
-      - name: Build, Start Server, and Run h1spec tests
+      - name: Build compliance server
+        run: nix develop "path:." -c zig build -Doptimize=ReleaseSafe
+
+      - name: Start compliance server
+        shell: bash
         run: |
-          nix develop -c bash -c "zig build"
-          nix develop -c bash -c "./zig-out/bin/h1spec" &
-          sleep 5
+          ./zig-out/bin/h1spec >"$RUNNER_TEMP/h1spec_server.log" 2>&1 &
+          server_pid=$!
+          printf '%s\n' "$server_pid" >"$RUNNER_TEMP/h1spec_server.pid"
+
+          ready=false
+          for attempt in $(seq 1 100); do
+            if ! kill -0 "$server_pid" 2>/dev/null; then
+              cat "$RUNNER_TEMP/h1spec_server.log"
+              exit 1
+            fi
+            if (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null; then
+              ready=true
+              break
+            fi
+            sleep 0.1
+          done
+          test "$ready" = true
+
+      - name: Run h1spec
+        run: |
           cd vendor/h1spec
-          deno run --allow-net http_test.ts 127.0.0.1 8000
+          deno run --allow-net=127.0.0.1:8000 http_test.ts 127.0.0.1 8000
+
+      - name: Stop compliance server
+        if: ${{ always() }}
+        run: |
+          if test -f "$RUNNER_TEMP/h1spec_server.pid"; then
+            kill "$(cat "$RUNNER_TEMP/h1spec_server.pid")" 2>/dev/null || true
+          fi
+
+      - name: Upload server log
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: h1spec-server-log
+          path: ${{ runner.temp }}/h1spec_server.log
+          if-no-files-found: error

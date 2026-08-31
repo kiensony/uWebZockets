@@ -1,13 +1,13 @@
 .{
     .name = .uWebZockets,
-    .version = "0.1.0",
+    .version = "1.0.0-alpha",
     .fingerprint = 0xbbf152173cd23d48,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         // farbenbuilds/zslay
         .zslay = .{
-            .url = "https://github.com/farbenbuilds/zslay/archive/refs/tags/v0.1.3-alpha.tar.gz",
-            .hash = "zslay-0.1.3-alpha-OB-IfHmQAADK-Qm9j874tzvze9_qvRtbxGHcUCeqBX_7",
+            .url = "https://github.com/farbenbuilds/zslay/archive/refs/tags/v0.1.5.tar.gz",
+            .hash = "zslay-0.1.5-OB-IfAocAQAzPdN5Y-1_lmzsu2ZZEofMg3sD92yYrP22",
         },
 
         // mitchellh/libxev
@@ -23,6 +23,17 @@
         "vendor",
         "LICENSE",
         "README.md",
+        "CHANGELOG.md",
+        "CODEBASE.md",
+        "CODING_CONVENTION.md",
+        "CONTRIBUTE.md",
+        "SECURITY.md",
+        "THIRD_PARTY_NOTICES.md",
+        "licenses",
+        "examples",
+        "tests",
+        "zig-cc",
+        "zig-c++",
         "flake.nix",
         "flake.lock",
     },

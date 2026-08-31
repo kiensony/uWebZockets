@@ -1,27 +1,118 @@
 # Contributing to µWebZockets
 
-Thank you for your interest in contributing to `µWebZockets`! To maintain our extreme performance targets and strict codebase quality, please read and adhere to the following guidelines before submitting a Pull Request.
+µWebZockets accepts focused changes that preserve bounded resource use,
+protocol correctness, and a shallow data-oriented design.
 
-## Prerequisites
-Before you start coding, please familiarize yourself with our core architectural documents:
-1. **[CODEBASE.md](./CODEBASE.md)**: Understand the directory structure and how we map to the original C++ `µWebSockets` stack.
-2. **[CODING_CONVENTION.md](./CODING_CONVENTION.md)**: Our strict style, naming, and formatting rules.
-3. **[CI_CD_PIPELINE.md](./CI_CD_PIPELINE.md)**: How your code will be tested and benchmarked.
+Read [CODEBASE.md](CODEBASE.md), [CODING_CONVENTION.md](CODING_CONVENTION.md),
+and [CI_CD_PIPELINE.md](CI_CD_PIPELINE.md) before changing the transport or
+protocol paths. Report security defects privately as described in
+[SECURITY.md](SECURITY.md).
 
-## The Three Pillars of µWebZockets
+## Development environment
 
-1. **Zero-Allocation Hot Paths**: The network request and response cycles must *never* dynamically allocate memory on the heap. Pre-allocate buffers or use arena allocators for temporary per-connection state. If a PR introduces a heap allocation in `src/http/` or `src/ws/`, it will be rejected.
-2. **Strictly Functional & DoD (No OOP)**: Do not try to emulate classes or bind hidden state to behavior. Separate data structures (designed for cache-locality using Data-Oriented Design) from the pure functions that operate on them.
-3. **Linux Kernel Styling in Zig**: We explicitly override Zig's standard naming convention. You *must* use Linux file naming (`snake_case`) across all files, as well as `snake_case` for functions and variables. Keep your control flow shallow (return early). And remember: **Emojis are strictly banned** anywhere in the repository, including PR descriptions and commit messages.
+Clone every submodule and use the pinned Nix shell when possible:
 
-## Development Workflow
+```sh
+git clone --recurse-submodules https://github.com/kiensony/uWebZockets.git
+cd uWebZockets
+nix develop
+```
 
-1. **Format your code**: Run `zig fmt` on your files. Unformatted code will fail CI immediately.
-2. **Run the tests**: Use `zig build test`. We use `std.testing.allocator` exclusively. If your code leaks memory, the tests will immediately fail.
-3. **Check Naming**: Double-check that you haven't slipped into `camelCase` for file names, local variables, or function names.
-4. **Write concise commit messages**: Be dense, precise, and have a high signal-to-noise ratio.
+The flake pins Nixpkgs 26.05. The non-Nix toolchain requires Zig 0.16.0, CMake,
+Ninja, Go, Python, Perl, and zlib development files.
 
-## Submitting a Pull Request
-- Ensure your PR passes all local tests (`zig build test`).
-- Expect your PR to be rigorously stress-tested in CI against the **Autobahn WebSockets Testsuite** and **h1spec**.
-- Performance regressions (measured in RPS and latency percentiles against the baseline) will block merges unless strongly justified.
+## Engineering requirements
+
+- Do not allocate in request parsing, frame parsing, masking, routing, or
+  network write callbacks. Allocate fixed application storage at startup.
+- Cap every peer-controlled length, count, queue, and subscription.
+- Prefer parallel arrays or compact slabs when a hot loop reads only a subset
+  of fields. Do not force Struct of Arrays onto small one-off records.
+- Keep parsing and validation functions pure where practical. Pass mutable I/O
+  state explicitly at the event-loop boundary.
+- Finish route registration before starting either listener; route arrays are
+  immutable once `listen` or `listen_udp` succeeds.
+- Use early returns and short error paths. Never silently swallow an error.
+- Use `snake_case` for project files, functions, and variables. Preserve raw C
+  identifiers only at the FFI boundary.
+- Keep comments concise and explain constraints or non-obvious tradeoffs.
+- Do not add emoji characters anywhere in the repository.
+- Keep new Zig unit tests inline in the implementation module. Do not move or
+  consolidate existing inline `test` blocks into `src/tests`.
+- Preserve upstream style in vendored submodules; update those through their
+  upstream project rather than rewriting vendored files.
+
+## Local checks
+
+Run all relevant checks before opening a pull request:
+
+```sh
+zig fmt --check build.zig src examples tests
+sh scripts/check_conventions.sh
+zig build test --summary all
+zig build test -Dsanitize=true -Doptimize=ReleaseSafe --summary all
+zig build test-compile -Doptimize=ReleaseSafe --summary all
+zig build fuzz --fuzz=100K -Doptimize=ReleaseSafe
+zig build lib -Doptimize=ReleaseFast --summary all
+```
+
+The sanitizer command requires native Linux. `nix develop` exports matching
+sanitizer, glibc, and dynamic-linker paths automatically. Non-Nix setups must
+pass `-Dsanitizer-lib-dir=/path/to/compiler/runtime/lib`. When that runtime
+uses a different glibc than the host, also pass matching
+`-Dsanitizer-libc-dir` and `-Dsanitizer-dynamic-linker` paths.
+
+Changes to WebSocket parsing or I/O must also run the Autobahn target. Changes
+to HTTP parsing, dispatch, or response framing must run h1spec. Changes to
+HTTP/3 must compile `http3_server`, exercise the inline QPACK/framing tests, and
+perform an interoperability check when a compatible client is available. The
+exact CI commands and report gate are documented in
+[CI_CD_PIPELINE.md](CI_CD_PIPELINE.md).
+
+Tests should use fixed caller-owned storage for hot paths. If the unit under
+test allocates, use `std.testing.allocator` or another leak-detecting allocator
+and prove all success and error paths release ownership.
+
+New external-byte parsers or framing transformations must have a bounded Zig
+fuzz target compatible with the existing libFuzzer-backed `zig build fuzz`
+step. FFI changes must preserve exact C layout checks and include malformed and
+capacity-exhaustion cases.
+
+## Pull requests
+
+- Explain the protocol, ownership, or performance invariant being changed.
+- Include regression tests for bugs and malformed-input tests for parsers.
+- Document API, limit, configuration, or compatibility changes.
+- Separate measured performance results from estimates.
+- Note breaking changes explicitly in the pull request and changelog.
+- Keep commits concise and follow
+  [.github/COMMIT_CONVENTION.md](.github/COMMIT_CONVENTION.md).
+
+## Dependency updates
+
+For Zig dependencies, update all generated package views together:
+
+- `build.zig.zon`
+- `build.zig.zon.json`
+- `build.zig.zon.nix`
+- `build.zig.zon.txt`
+
+Record the upstream version, immutable URL or revision, Zig package hash, Nix
+hash, license, and any API migration. Rebuild from an empty Zig/vendor cache so
+a stale artifact cannot hide a dependency problem.
+
+For C/C++ submodules, retain CMake target-based builds, Ninja execution, the
+Zig compiler wrappers, target-specific cache directories, and static-library
+outputs. Do not add global compiler or linker flags when target-local settings
+work.
+
+## Releasing
+
+1. Set the same version in `build.zig.zon` and `flake.nix`.
+2. Add a dated `CHANGELOG.md` section with breaking changes and limitations.
+3. Verify `THIRD_PARTY_NOTICES.md` and every packaged license.
+4. Pass local formatting, convention, test, and build checks.
+5. Pass sanitizer, fuzz, Autobahn, and h1spec checks on the release commit.
+6. Tag the final commit as `v<version>` and push the tag.
+7. Review all six `Publish` environment deployments, archives, and
+   `SHA256SUMS` before announcing the release.

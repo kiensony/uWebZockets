@@ -15,7 +15,10 @@ test "core: bitset pool acquires and releases slots" {
     try std.testing.expect(item != null);
     try std.testing.expectEqual(@as(usize, 1), pool.count_active());
 
-    pool.release(item.?);
+    try std.testing.expect(pool.release(item.?));
+    try std.testing.expect(!pool.release(item.?));
+    var foreign: usize = 0;
+    try std.testing.expect(!pool.release(&foreign));
     try std.testing.expectEqual(@as(usize, 0), pool.count_active());
 }
 
@@ -29,7 +32,10 @@ test "core: freelist pool acquires and releases slots" {
     try std.testing.expect(item != null);
     try std.testing.expectEqual(@as(usize, 1), pool.count_active());
 
-    pool.release(item.?);
+    try std.testing.expect(pool.release(item.?));
+    try std.testing.expect(!pool.release(item.?));
+    var foreign: usize = 0;
+    try std.testing.expect(!pool.release(&foreign));
     try std.testing.expectEqual(@as(usize, 0), pool.count_active());
 }
 
@@ -52,7 +58,7 @@ fn dummy_accept(socket: @import("xev").TCP, user_data: ?*anyopaque) void {
 test "core: tcp server init" {
     // bind to ephemeral port 0 to prevent port collisions during tests.
     const server = try tcp.init_server("127.0.0.1", 0, dummy_accept, null);
-    _ = server;
+    defer _ = std.posix.system.close(server.listener.fd);
 }
 
 // dummy callback for timer test.

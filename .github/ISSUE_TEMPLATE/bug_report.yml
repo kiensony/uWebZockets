@@ -6,8 +6,8 @@ body:
     attributes:
       value: |
         ## Bug Report
-        Thank you for reporting an issue in **µWebZockets**. 
-        *Note: If this is a memory safety issue (out-of-bounds read, use-after-free) or a parser panic, please use the `Security Vulnerability` template instead.*
+        Thank you for reporting an issue in **µWebZockets**.
+        Do not disclose memory-safety defects, parser vulnerabilities, or other security issues publicly. Follow `SECURITY.md` and email the maintainers privately.
   - type: input
     id: bug-description
     attributes:

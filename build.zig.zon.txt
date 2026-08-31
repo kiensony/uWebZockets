@@ -1,2 +1,2 @@
 git+https://github.com/mitchellh/libxev#9ce8e8e6ff89e583258a7f8e7adeeeaeae8611bf
-https://github.com/farbenbuilds/zslay/archive/refs/tags/v0.1.3-alpha.tar.gz
+https://github.com/farbenbuilds/zslay/archive/refs/tags/v0.1.5.tar.gz

@@ -6,190 +6,336 @@ const zslay = @import("zslay");
 
 pub const Handler = *const fn (req: *Request, res: *Response) void;
 
-// websocket route behavior interface.
-// users only need to define the callbacks they care about.
-pub const WsBehavior = struct {
-    open: ?*const fn (ws: *WebSocket) void = null,
-    message: ?*const fn (ws: *WebSocket, message: []const u8, opcode: zslay.Opcode) void = null,
-    close: ?*const fn (ws: *WebSocket) void = null,
+pub const WsCompression = enum(u8) {
+    disabled,
+    permessage_deflate,
 };
 
-pub const RouteType = enum { http, websocket };
+pub const WsBehavior = struct {
+    upgrade: ?*const fn (req: *const Request) bool = null,
+    open: ?*const fn (ws: *WebSocket) void = null,
+    message: ?*const fn (ws: *WebSocket, message: []const u8, opcode: zslay.Opcode) void = null,
+    drain: ?*const fn (ws: *WebSocket) void = null,
+    close: ?*const fn (ws: *WebSocket) void = null,
+    compression: WsCompression = .disabled,
+    max_frame_size: u64 = 16 * 1024,
+    max_message_size: u64 = 16 * 1024,
+};
 
-pub const RouteNode = struct {
-    path: []const u8 = "",
-    route_type: RouteType = .http,
-    http_handler: ?Handler = null,
-    ws_behavior: ?WsBehavior = null,
+pub fn valid_ws_limits(behavior: WsBehavior, message_capacity: usize) bool {
+    if (behavior.max_frame_size == 0 or behavior.max_message_size == 0) return false;
+    if (behavior.max_frame_size > behavior.max_message_size) return false;
+    return behavior.max_message_size <= @as(u64, @intCast(message_capacity));
+}
+
+pub const HttpMethod = enum(u8) {
+    get,
+    head,
+    post,
+    put,
+    delete,
+    patch,
+    options,
+    any,
+
+    pub fn parse(value: []const u8) ?HttpMethod {
+        if (std.mem.eql(u8, value, "GET")) return .get;
+        if (std.mem.eql(u8, value, "HEAD")) return .head;
+        if (std.mem.eql(u8, value, "POST")) return .post;
+        if (std.mem.eql(u8, value, "PUT")) return .put;
+        if (std.mem.eql(u8, value, "DELETE")) return .delete;
+        if (std.mem.eql(u8, value, "PATCH")) return .patch;
+        if (std.mem.eql(u8, value, "OPTIONS")) return .options;
+        return null;
+    }
+
+    pub fn name(method: HttpMethod) []const u8 {
+        return switch (method) {
+            .get => "GET",
+            .head => "HEAD",
+            .post => "POST",
+            .put => "PUT",
+            .delete => "DELETE",
+            .patch => "PATCH",
+            .options => "OPTIONS",
+            .any => "",
+        };
+    }
+};
+
+const method_count = @typeInfo(HttpMethod).@"enum".fields.len;
+const concrete_methods = [_]HttpMethod{ .get, .head, .post, .put, .delete, .patch, .options };
+const all_method_mask: u16 = (@as(u16, 1) << concrete_methods.len) - 1;
+
+pub const RouteMatch = struct {
+    path: []const u8,
+    http_handler: ?Handler,
+    ws_behavior: ?WsBehavior,
+    allowed_methods: u16,
+    has_http: bool,
 };
 
 const max_nodes = 256;
-const null_node: u16 = 0xFFFF;
+const max_route_path_size = 2048;
+const null_node: u16 = std.math.maxInt(u16);
+const empty_handlers = [_]?Handler{null} ** method_count;
 
-// zero-allocation radix trie router using struct of arrays (soa)
-// for maximum cpu cache locality and data-oriented design (dod).
 pub const Router = struct {
     segments: [max_nodes][]const u8 = undefined,
     first_child: [max_nodes]u16 = .{null_node} ** max_nodes,
     next_sibling: [max_nodes]u16 = .{null_node} ** max_nodes,
     has_route: [max_nodes]bool = .{false} ** max_nodes,
-    route_types: [max_nodes]RouteType = undefined,
-    http_handlers: [max_nodes]?Handler = .{null} ** max_nodes,
+    http_handlers: [max_nodes][method_count]?Handler = .{empty_handlers} ** max_nodes,
     ws_behaviors: [max_nodes]?WsBehavior = .{null} ** max_nodes,
 
     node_count: u16 = 0,
     root_idx: u16 = null_node,
 
     pub fn init() Router {
-        var r = Router{};
-        r.root_idx = r.alloc_node("");
-        return r;
+        var router = Router{};
+        router.root_idx = 0;
+        router.node_count = 1;
+        router.segments[0] = "";
+        router.first_child[0] = null_node;
+        router.next_sibling[0] = null_node;
+        router.has_route[0] = false;
+        router.http_handlers[0] = empty_handlers;
+        router.ws_behaviors[0] = null;
+        return router;
     }
 
-    fn alloc_node(self: *Router, segment: []const u8) u16 {
-        if (self.node_count >= max_nodes) @panic("router nodes exhausted");
-        const idx = self.node_count;
+    fn alloc_node(self: *Router, segment: []const u8) !u16 {
+        if (self.node_count >= max_nodes) return error.RouteCapacityReached;
+
+        const index = self.node_count;
         self.node_count += 1;
-        self.segments[idx] = segment;
-        self.first_child[idx] = null_node;
-        self.next_sibling[idx] = null_node;
-        self.has_route[idx] = false;
-        return idx;
+        self.segments[index] = segment;
+        self.first_child[index] = null_node;
+        self.next_sibling[index] = null_node;
+        self.has_route[index] = false;
+        self.http_handlers[index] = empty_handlers;
+        self.ws_behaviors[index] = null;
+        return index;
     }
 
-    fn set_route(self: *Router, idx: u16, route: RouteNode) void {
-        self.has_route[idx] = true;
-        self.route_types[idx] = route.route_type;
-        self.http_handlers[idx] = route.http_handler;
-        self.ws_behaviors[idx] = route.ws_behavior;
+    fn common_prefix(first: []const u8, second: []const u8) usize {
+        const length = @min(first.len, second.len);
+        var index: usize = 0;
+        while (index < length and first[index] == second[index]) : (index += 1) {}
+        return index;
     }
 
-    fn common_prefix(a: []const u8, b: []const u8) usize {
-        const len = @min(a.len, b.len);
-        var i: usize = 0;
-        while (i < len and a[i] == b[i]) : (i += 1) {}
-        return i;
+    fn valid_path(path: []const u8) bool {
+        if (path.len == 0 or path.len > max_route_path_size) return false;
+        if (path[0] != '/') return false;
+        if (std.mem.indexOfAny(u8, path, "?#\r\n") != null) return false;
+        return true;
     }
 
-    fn insert(self: *Router, path: []const u8, route: RouteNode) void {
-        if (self.node_count == 0) {
-            self.root_idx = self.alloc_node("");
-        }
+    fn insert_path(self: *Router, path: []const u8) !u16 {
+        if (!valid_path(path)) return error.InvalidRoutePath;
 
-        var curr = self.root_idx;
+        var current = self.root_idx;
         var search = path;
 
         while (true) {
-            if (search.len == 0) {
-                self.set_route(curr, route);
-                return;
-            }
+            if (search.len == 0) return current;
 
             var best_child: u16 = null_node;
             var best_prefix: usize = 0;
-            var prev_sibling: u16 = null_node;
+            var child = self.first_child[current];
 
-            var child = self.first_child[curr];
             while (child != null_node) : (child = self.next_sibling[child]) {
-                const seg = self.segments[child];
-                const prefix = common_prefix(seg, search);
-                if (prefix > 0) {
-                    best_child = child;
-                    best_prefix = prefix;
-                    break;
-                }
-                prev_sibling = child;
+                const prefix = common_prefix(self.segments[child], search);
+                if (prefix == 0) continue;
+                best_child = child;
+                best_prefix = prefix;
+                break;
             }
 
             if (best_child == null_node) {
-                const new_child = self.alloc_node(search);
-                self.set_route(new_child, route);
-                self.next_sibling[new_child] = self.first_child[curr];
-                self.first_child[curr] = new_child;
-                return;
+                const new_child = try self.alloc_node(search);
+                self.next_sibling[new_child] = self.first_child[current];
+                self.first_child[current] = new_child;
+                return new_child;
             }
 
-            const child_seg = self.segments[best_child];
-            if (best_prefix < child_seg.len) {
-                const split_node = self.alloc_node(child_seg[best_prefix..]);
+            const child_segment = self.segments[best_child];
+            if (best_prefix < child_segment.len) {
+                const required_nodes: u16 = if (best_prefix < search.len) 2 else 1;
+                if (required_nodes > max_nodes - self.node_count) {
+                    return error.RouteCapacityReached;
+                }
 
+                const split_node = try self.alloc_node(child_segment[best_prefix..]);
                 self.first_child[split_node] = self.first_child[best_child];
                 self.has_route[split_node] = self.has_route[best_child];
-                self.route_types[split_node] = self.route_types[best_child];
                 self.http_handlers[split_node] = self.http_handlers[best_child];
                 self.ws_behaviors[split_node] = self.ws_behaviors[best_child];
 
-                self.segments[best_child] = child_seg[0..best_prefix];
+                self.segments[best_child] = child_segment[0..best_prefix];
                 self.first_child[best_child] = split_node;
                 self.has_route[best_child] = false;
-                self.http_handlers[best_child] = null;
+                self.http_handlers[best_child] = empty_handlers;
                 self.ws_behaviors[best_child] = null;
             }
 
-            if (best_prefix == search.len) {
-                self.set_route(best_child, route);
-                return;
-            }
-
-            curr = best_child;
+            if (best_prefix == search.len) return best_child;
+            current = best_child;
             search = search[best_prefix..];
         }
     }
 
-    // registers an http get route.
-    pub fn get(self: *Router, path: []const u8, handler: Handler) void {
-        self.insert(path, .{
-            .route_type = .http,
+    fn register_http(self: *Router, path: []const u8, method: HttpMethod, handler: Handler) !void {
+        const node = try self.insert_path(path);
+        const method_index = @intFromEnum(method);
+        if (self.http_handlers[node][method_index] != null) return error.RouteAlreadyRegistered;
+
+        self.http_handlers[node][method_index] = handler;
+        self.has_route[node] = true;
+    }
+
+    pub fn get(self: *Router, path: []const u8, handler: Handler) !void {
+        return self.register_http(path, .get, handler);
+    }
+
+    pub fn head(self: *Router, path: []const u8, handler: Handler) !void {
+        return self.register_http(path, .head, handler);
+    }
+
+    pub fn post(self: *Router, path: []const u8, handler: Handler) !void {
+        return self.register_http(path, .post, handler);
+    }
+
+    pub fn put(self: *Router, path: []const u8, handler: Handler) !void {
+        return self.register_http(path, .put, handler);
+    }
+
+    pub fn delete(self: *Router, path: []const u8, handler: Handler) !void {
+        return self.register_http(path, .delete, handler);
+    }
+
+    pub fn patch(self: *Router, path: []const u8, handler: Handler) !void {
+        return self.register_http(path, .patch, handler);
+    }
+
+    pub fn options(self: *Router, path: []const u8, handler: Handler) !void {
+        return self.register_http(path, .options, handler);
+    }
+
+    pub fn any(self: *Router, path: []const u8, handler: Handler) !void {
+        return self.register_http(path, .any, handler);
+    }
+
+    pub fn ws(self: *Router, path: []const u8, behavior: WsBehavior) !void {
+        const node = try self.insert_path(path);
+        if (self.ws_behaviors[node] != null) return error.RouteAlreadyRegistered;
+
+        self.ws_behaviors[node] = behavior;
+        self.has_route[node] = true;
+    }
+
+    pub fn match(self: *const Router, path: []const u8, method: ?HttpMethod) ?RouteMatch {
+        const node = self.find_node(path) orelse return null;
+        var handler: ?Handler = null;
+
+        if (method) |known_method| {
+            handler = self.http_handlers[node][@intFromEnum(known_method)];
+            if (handler == null and known_method == .head) {
+                handler = self.http_handlers[node][@intFromEnum(HttpMethod.get)];
+            }
+        }
+        if (handler == null) handler = self.http_handlers[node][@intFromEnum(HttpMethod.any)];
+
+        return .{
+            .path = path,
             .http_handler = handler,
-        });
+            .ws_behavior = self.ws_behaviors[node],
+            .allowed_methods = self.allowed_method_mask(node),
+            .has_http = self.node_has_http(node),
+        };
     }
 
-    // registers a websocket route.
-    pub fn ws(self: *Router, path: []const u8, behavior: WsBehavior) void {
-        self.insert(path, .{
-            .route_type = .websocket,
-            .ws_behavior = behavior,
-        });
-    }
-
-    // matches a requested path against the radix trie.
-    // uses fast first-character elimination for sibling checks.
-    pub fn match(self: *const Router, path: []const u8) ?RouteNode {
+    fn find_node(self: *const Router, path: []const u8) ?u16 {
         if (self.node_count == 0) return null;
 
-        var curr = self.root_idx;
+        var current = self.root_idx;
         var search = path;
 
         while (true) {
-            if (search.len == 0) {
-                if (self.has_route[curr]) {
-                    return RouteNode{
-                        .path = path,
-                        .route_type = self.route_types[curr],
-                        .http_handler = self.http_handlers[curr],
-                        .ws_behavior = self.ws_behaviors[curr],
-                    };
-                }
-                return null;
-            }
+            if (search.len == 0) return if (self.has_route[current]) current else null;
 
-            var child = self.first_child[curr];
+            var child = self.first_child[current];
             var found = false;
             const first_char = search[0];
 
             while (child != null_node) : (child = self.next_sibling[child]) {
-                const seg = self.segments[child];
-                if (seg.len > 0 and seg[0] == first_char) {
-                    if (std.mem.startsWith(u8, search, seg)) {
-                        curr = child;
-                        search = search[seg.len..];
-                        found = true;
-                    }
-                    break; // branches are unique by first character
-                }
+                const segment = self.segments[child];
+                if (segment.len == 0 or segment[0] != first_char) continue;
+                if (!std.mem.startsWith(u8, search, segment)) return null;
+
+                current = child;
+                search = search[segment.len..];
+                found = true;
+                break;
             }
 
             if (!found) return null;
         }
     }
+
+    fn node_has_http(self: *const Router, node: u16) bool {
+        for (self.http_handlers[node]) |handler| {
+            if (handler != null) return true;
+        }
+        return false;
+    }
+
+    fn allowed_method_mask(self: *const Router, node: u16) u16 {
+        if (self.http_handlers[node][@intFromEnum(HttpMethod.any)] != null) {
+            return all_method_mask;
+        }
+
+        var mask: u16 = 0;
+        for (concrete_methods) |method| {
+            if (self.http_handlers[node][@intFromEnum(method)] == null) continue;
+            mask |= method_bit(method);
+            if (method == .get) mask |= method_bit(.head);
+        }
+        if (self.ws_behaviors[node] != null) mask |= method_bit(.get);
+        return mask;
+    }
 };
+
+pub fn format_allowed_methods(mask: u16, buffer: []u8) ![]const u8 {
+    var offset: usize = 0;
+
+    for (concrete_methods) |method| {
+        if (mask & method_bit(method) == 0) continue;
+
+        const separator = if (offset == 0) "" else ", ";
+        const method_name = method.name();
+        if (separator.len + method_name.len > buffer.len - offset) return error.BufferTooSmall;
+
+        @memcpy(buffer[offset .. offset + separator.len], separator);
+        offset += separator.len;
+        @memcpy(buffer[offset .. offset + method_name.len], method_name);
+        offset += method_name.len;
+    }
+    return buffer[0..offset];
+}
+
+fn method_bit(method: HttpMethod) u16 {
+    std.debug.assert(method != .any);
+    return @as(u16, 1) << @as(u4, @intCast(@intFromEnum(method)));
+}
+
+test "router: websocket limits must fit the configured slab" {
+    try std.testing.expect(valid_ws_limits(.{}, 16 * 1024));
+    try std.testing.expect(!valid_ws_limits(.{ .max_frame_size = 0 }, 16 * 1024));
+    try std.testing.expect(!valid_ws_limits(.{ .max_message_size = 32 * 1024 }, 16 * 1024));
+    try std.testing.expect(!valid_ws_limits(.{
+        .max_frame_size = 1024,
+        .max_message_size = 512,
+    }, 16 * 1024));
+}

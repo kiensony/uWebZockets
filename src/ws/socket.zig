@@ -3,289 +3,649 @@ const tcp = @import("../core/tcp.zig");
 const TcpConnection = tcp.TcpConnection;
 const Request = @import("../http/request.zig").Request;
 const Response = @import("../http/response.zig").Response;
+const radix = @import("../router/radix.zig");
+const WsBehavior = radix.WsBehavior;
 const zslay = @import("zslay");
 const handshake = @import("handshake.zig");
-const PubSubEngine = @import("pubsub.zig").PubSubEngine;
 const deflate = @import("deflate.zig");
+const mask = @import("mask.zig");
+const utf8 = @import("utf8.zig");
+const PubSubEngine = @import("pubsub.zig").PubSubEngine;
 
-// a zero-allocation websocket connection wrapper.
-// takes over the raw tcp stream after a successful http 101 upgrade.
 pub const WebSocket = struct {
     conn: *TcpConnection,
-    behavior: @import("../router/radix.zig").WsBehavior = .{},
+    pubsub: ?*PubSubEngine = null,
+    behavior: WsBehavior = .{},
     z_conn: zslay.Conn = undefined,
     tx_nodes: [4]zslay.Conn.FrameNode = undefined,
-
-    // pointer to the central pub/sub engine
-    pubsub: ?*PubSubEngine = null,
-
-    // pointer to the shared compression engine
-    compressor: ?*deflate.Compressor = null,
-
-    // static buffer to hold compressed payload before framing (8kb is sufficient for real-time events)
-    deflate_buffer: [8192]u8 = undefined,
-
-    // flag indicating if the client supports permessage-deflate
-    permessage_deflate: bool = false,
-
-    // message assembly for fragmented websocket frames
-    msg_buffer: std.ArrayListUnmanaged(u8) = .empty,
     current_opcode: ?zslay.Opcode = null,
-
-    // static buffer for control frame payloads (max 125 bytes per RFC 6455)
+    message_len: usize = 0,
+    compressed_len: usize = 0,
+    permessage_deflate: ?handshake.PerMessageDeflate = null,
+    utf8_state: utf8.State = .{},
+    frame_rsv1: bool = false,
+    frame_compression_checked: bool = false,
+    message_compressed: bool = false,
+    close_sent: bool = false,
+    close_received: bool = false,
+    close_notified: bool = false,
+    initialized: bool = false,
     control_buffer: [125]u8 = undefined,
 
-    // handles the protocol upgrade from http/1.1 to websocket.
-    pub fn upgrade(self: *WebSocket, req: *const Request, res: *Response, behavior: @import("../router/radix.zig").WsBehavior) void {
+    pub fn upgrade(self: *WebSocket, req: *const Request, res: *Response, behavior: WsBehavior) void {
         self.behavior = behavior;
 
-        const ws_key = req.get_header("Sec-WebSocket-Key") orelse {
-            res.end("400 Bad Request", "Missing Sec-WebSocket-Key") catch {};
+        if (!radix.valid_ws_limits(behavior, self.conn.ws_message_buffer.len)) {
+            reject_upgrade(res, self.conn, "500 Internal Server Error", "Invalid WebSocket limits", false);
             return;
-        };
-
-        var accept_token_buf: [28]u8 = undefined;
-        const accept_token = handshake.compute_accept_token(ws_key, &accept_token_buf);
-
-        if (accept_token.len == 0) {
-            res.end("500 Internal Server Error", "Handshake failed") catch {};
+        }
+        if (behavior.compression == .permessage_deflate and
+            (self.conn.ws_deflate == null or
+                self.conn.ws_compression_buffer.len == 0 or
+                self.conn.ws_compression_output_buffer.len == 0))
+        {
+            reject_upgrade(res, self.conn, "500 Internal Server Error", "Compression unavailable", false);
             return;
         }
 
-        if (req.get_header("Sec-WebSocket-Extensions")) |exts| {
-            if (std.mem.indexOf(u8, exts, "permessage-deflate") != null) {
-                self.permessage_deflate = true;
+        const client_key = handshake.validate_request(
+            req.method,
+            unique_header(req, "Connection"),
+            unique_header(req, "Upgrade"),
+            unique_header(req, "Sec-WebSocket-Version"),
+            unique_header(req, "Sec-WebSocket-Key"),
+        ) catch |err| {
+            const unsupported_version = err == error.MissingVersion or err == error.UnsupportedVersion;
+            const status = if (unsupported_version) "426 Upgrade Required" else "400 Bad Request";
+            reject_upgrade(res, self.conn, status, "Invalid WebSocket handshake", unsupported_version);
+            return;
+        };
+
+        if (behavior.upgrade) |authorize| {
+            if (!authorize(req)) {
+                reject_upgrade(res, self.conn, "403 Forbidden", "WebSocket upgrade rejected", false);
+                return;
             }
         }
 
-        const ext_header = if (self.permessage_deflate) "Sec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover; server_no_context_takeover\r\n" else "";
-
-        var header_buf: [256]u8 = undefined;
-        const headers = std.fmt.bufPrint(&header_buf, "HTTP/1.1 101 Switching Protocols\r\n" ++
-            "Upgrade: websocket\r\n" ++
-            "Connection: Upgrade\r\n" ++
-            "Sec-WebSocket-Accept: {s}\r\n" ++
-            "{s}\r\n", .{ accept_token, ext_header }) catch {
-            res.end("500 Internal Server Error", "Header too large") catch {};
+        self.z_conn = zslay.Conn.init(&self.tx_nodes, .{
+            .role = .server,
+            .max_frame_len = behavior.max_frame_size,
+            .max_message_len = behavior.max_message_size,
+        }) catch {
+            reject_upgrade(res, self.conn, "500 Internal Server Error", "Invalid WebSocket limits", false);
             return;
         };
 
-        // initialize zslay parser state
-        self.z_conn = zslay.Conn.init(&self.tx_nodes);
+        var accept_buffer: [28]u8 = undefined;
+        const accept_token = handshake.compute_accept_token(client_key, &accept_buffer);
+        if (accept_token.len == 0) {
+            reject_upgrade(res, self.conn, "500 Internal Server Error", "Handshake failed", false);
+            return;
+        }
 
-        self.conn.write_data(headers);
+        self.permessage_deflate = if (behavior.compression == .permessage_deflate)
+            negotiate_permessage_deflate(req)
+        else
+            null;
 
-        // context switch: hijack the tcp read callback.
+        var extension_buffer: [192]u8 = undefined;
+        const extension_header = if (self.permessage_deflate) |negotiated|
+            handshake.format_permessage_deflate_response(negotiated, &extension_buffer) catch {
+                reject_upgrade(res, self.conn, "500 Internal Server Error", "Handshake failed", false);
+                return;
+            }
+        else
+            "";
+
+        var response_buffer: [512]u8 = undefined;
+        const response = std.fmt.bufPrint(
+            &response_buffer,
+            "HTTP/1.1 101 Switching Protocols\r\n" ++
+                "Upgrade: websocket\r\n" ++
+                "Connection: Upgrade\r\n" ++
+                "Sec-WebSocket-Accept: {s}\r\n" ++
+                "{s}\r\n",
+            .{ accept_token, extension_header },
+        ) catch {
+            reject_upgrade(res, self.conn, "500 Internal Server Error", "Handshake failed", false);
+            return;
+        };
+
+        self.conn.write_data(response) catch {
+            tcp.close_connection(self.conn);
+            return;
+        };
+
+        self.message_len = 0;
+        self.compressed_len = 0;
+        self.current_opcode = null;
+        self.utf8_state = .{};
+        self.frame_rsv1 = false;
+        self.frame_compression_checked = false;
+        self.message_compressed = false;
+        self.close_sent = false;
+        self.close_received = false;
+        self.close_notified = false;
+        self.initialized = true;
         self.conn.protocol_state = .websocket;
 
-        if (self.behavior.open) |cb| cb(self);
+        if (self.behavior.open) |callback| callback(self);
     }
 
-    // helper to send a close frame
-    pub fn send_close(self: *WebSocket, code: u16, reason: []const u8) void {
+    pub fn send_close(self: *WebSocket, code: u16, reason: []const u8) !void {
+        if (self.close_sent) return;
+        if (!valid_close_code(code)) return error.InvalidCloseCode;
+        if (reason.len > 123) return error.ControlFrameTooLarge;
+        if (!std.unicode.utf8ValidateSlice(reason)) return error.InvalidUtf8;
+
         var payload: [125]u8 = undefined;
         std.mem.writeInt(u16, payload[0..2], code, .big);
-        const copy_len = @min(reason.len, 123);
-        @memcpy(payload[2 .. 2 + copy_len], reason[0..copy_len]);
-        self.send(payload[0 .. 2 + copy_len], .close);
+        @memcpy(payload[2 .. 2 + reason.len], reason);
+        try self.send(payload[0 .. 2 + reason.len], .close);
     }
 
-    // application-facing api to send data back to the client.
-    pub fn send(self: *WebSocket, data: []const u8, opcode: zslay.Opcode) void {
-        var payload_to_send = data;
-        var is_compressed = false;
+    pub fn send(self: *WebSocket, data: []const u8, opcode: zslay.Opcode) !void {
+        if (!self.initialized or self.conn.closing) {
+            return error.ConnectionClosed;
+        }
+        if (self.close_received and opcode != .close) return error.ConnectionClosed;
+        if (self.close_sent and opcode != .close) return error.ConnectionClosed;
+        if (self.close_sent and opcode == .close) return;
 
-        // compress payload if client supports it, data is not empty, and compressor is available
-        if (self.permessage_deflate and data.len > 0) {
-            if (self.compressor) |comp| {
-                if (deflate.compress(comp.*, data, &self.deflate_buffer)) |compressed| {
-                    payload_to_send = compressed;
-                    is_compressed = true;
-                } else |_| {
-                    // if compression fails (e.g. buffer too small), fallback to sending plaintext
-                }
-            }
+        try validate_outgoing_payload(data, opcode);
+
+        var payload = data;
+        var compressed = false;
+        if (self.permessage_deflate != null and (opcode == .text or opcode == .binary)) {
+            const context = self.conn.ws_deflate orelse return error.CompressionUnavailable;
+            const window_bits = self.permessage_deflate.?.server_max_window_bits orelse 15;
+            payload = try context.compress_message_window(
+                data,
+                self.conn.ws_compression_output_buffer,
+                window_bits,
+            );
+            compressed = true;
         }
 
-        var frame_header: [14]u8 = undefined;
-
-        const header_struct = zslay.FrameHeader{
-            .payload_len = if (payload_to_send.len < 126) @intCast(payload_to_send.len) else if (payload_to_send.len <= 65535) 126 else 127,
-            .mask = false,
-            .opcode = @intCast(@intFromEnum(opcode)),
-            .rsv3 = false,
-            .rsv2 = false,
-            .rsv1 = is_compressed,
-            .fin = true,
-        };
-
-        const header_len = zslay.encode_header(&frame_header, header_struct, payload_to_send.len, null) catch return;
-
-        // allocate dynamic buffer for sending to avoid dropping large frames
-        const total_len = header_len + payload_to_send.len;
-
-        var packet = std.heap.c_allocator.alloc(u8, total_len) catch {
-            std.debug.print("OOM allocating send buffer\n", .{});
-            return;
-        };
-
-        @memcpy(packet[0..header_len], frame_header[0..header_len]);
-        @memcpy(packet[header_len..total_len], payload_to_send);
-
-        // enqueue into tcp connection (write_data must handle dynamic slices and free them)
-        self.conn.write_data_dynamic(packet);
+        var node = try self.z_conn.prepare_frame(true, opcode, payload, false, null);
+        if (compressed) node.header_buf[0] |= 0x40;
+        try self.conn.write_data_parts(&.{ node.header_buf[0..node.header_size], payload });
+        if (opcode == .close) {
+            self.close_sent = true;
+            tcp.close_after_flush(self.conn);
+        }
     }
 
-    // processes raw byte stream when the connection is upgraded to websocket.
-    // uses zslay to extract frames and perform in-place XOR unmasking.
+    pub fn buffered_amount(self: *const WebSocket) usize {
+        return self.conn.buffered_amount();
+    }
+
     pub fn on_data(self: *WebSocket, data: []u8) void {
         var offset: usize = 0;
 
-        // a tcp packet might contain multiple websocket frames,
-        // or just a fragment of one.
-        while (offset < data.len) {
+        while (!self.conn.closing) {
             const action = self.z_conn.advance_rx() catch |err| {
-                std.debug.print("protocol error: {}\n", .{err});
-                self.send_close(1002, "Protocol error");
-                tcp.close_connection(self.conn);
+                const code: u16 = if (err == error.PayloadTooLarge) 1009 else 1002;
+                self.fail(code, if (code == 1009) "Message too large" else "Protocol error");
                 return;
             };
 
             switch (action) {
                 .need_header => {
-                    const buf = self.z_conn.get_header_buffer();
-                    const available = data.len - offset;
-                    const to_copy = @min(buf.len, available);
-
-                    @memcpy(buf[0..to_copy], data[offset .. offset + to_copy]);
-                    self.z_conn.advance_header_read(to_copy);
-                    offset += to_copy;
+                    if (offset == data.len) return;
+                    const header_buffer = self.z_conn.get_header_buffer();
+                    const header_offset = self.z_conn.header_bytes_read;
+                    const copy_len = @min(header_buffer.len, data.len - offset);
+                    @memcpy(header_buffer[0..copy_len], data[offset .. offset + copy_len]);
+                    if (header_offset == 0) {
+                        self.frame_rsv1 = (header_buffer[0] & 0x40) != 0;
+                        self.frame_compression_checked = false;
+                        header_buffer[0] &= 0xbf;
+                    }
+                    self.z_conn.advance_header_read(copy_len) catch {
+                        self.fail(1002, "Protocol error");
+                        return;
+                    };
+                    offset += copy_len;
                 },
                 .need_payload => {
-                    const dh = self.z_conn.decoded_header.?;
-                    const remaining_payload = dh.extended_len - self.z_conn.payload_bytes_processed;
-                    const available = data.len - offset;
-                    const to_process = @min(remaining_payload, available);
+                    if (offset == data.len) return;
+                    const decoded = self.z_conn.decoded_header orelse {
+                        self.fail(1002, "Protocol error");
+                        return;
+                    };
+                    const opcode: zslay.Opcode = @enumFromInt(decoded.header.opcode);
+                    if (!self.validate_frame_compression(opcode)) return;
+                    const remaining = decoded.extended_len - self.z_conn.payload_bytes_processed;
+                    const available: u64 = @intCast(data.len - offset);
+                    const process_len_u64 = @min(remaining, available);
+                    const process_len: usize = @intCast(process_len_u64);
+                    const chunk = data[offset .. offset + process_len];
 
-                    // chunk of payload unmasked in-place. zero-allocation.
-                    const chunk = data[offset .. offset + to_process];
-
-                    if (dh.masking_key) |mkey| {
-                        zslay.mask(chunk, mkey, self.z_conn.payload_bytes_processed);
+                    if (decoded.masking_key) |masking_key| {
+                        mask.apply(chunk, masking_key, self.z_conn.payload_bytes_processed);
                     }
 
-                    const op: zslay.Opcode = @enumFromInt(dh.header.opcode);
-                    const is_control = op.is_control();
-
-                    // fast path: entire unfragmented message fits in this TCP chunk. No alloc!
-                    const fast_path = !is_control and self.msg_buffer.items.len == 0 and self.z_conn.payload_bytes_processed == 0 and to_process == dh.extended_len and dh.header.fin;
-
-                    if (is_control) {
-                        const start = self.z_conn.payload_bytes_processed;
-                        if (start + to_process <= self.control_buffer.len) {
-                            @memcpy(self.control_buffer[start .. start + to_process], chunk);
+                    const message_opcode = if (opcode == .continuation)
+                        self.current_opcode orelse {
+                            self.fail(1002, "Protocol error");
+                            return;
                         }
-                    } else if (!fast_path) {
-                        self.msg_buffer.appendSlice(std.heap.c_allocator, chunk) catch {
-                            self.send_close(1011, "Internal server error");
-                            tcp.close_connection(self.conn);
+                    else
+                        opcode;
+                    if (opcode != .continuation and
+                        !opcode.is_control() and
+                        self.z_conn.payload_bytes_processed == 0)
+                    {
+                        self.utf8_state = .{};
+                    }
+                    if (!self.message_compressed and message_opcode == .text) {
+                        self.utf8_state = utf8.validate_chunk(self.utf8_state, chunk) orelse {
+                            self.fail(1007, "Invalid UTF-8");
                             return;
                         };
                     }
+                    const fast_path = !opcode.is_control() and
+                        !self.message_compressed and
+                        opcode != .continuation and
+                        self.message_len == 0 and
+                        self.z_conn.payload_bytes_processed == 0 and
+                        process_len_u64 == decoded.extended_len and
+                        decoded.header.fin;
 
-                    self.z_conn.payload_bytes_processed += to_process;
-
-                    if (self.z_conn.payload_bytes_processed == dh.extended_len) {
-                        if (is_control) {
-                            const ctrl_payload = self.control_buffer[0..@min(dh.extended_len, 125)];
-                            if (op == .ping) {
-                                self.send(ctrl_payload, .pong);
-                            } else if (op == .pong) {
-                                // update heartbeat/time-to-live to prevent timeout
-                            } else if (op == .close) {
-                                if (dh.extended_len >= 2) {
-                                    const code = std.mem.readInt(u16, ctrl_payload[0..2], .big);
-                                    const reason = ctrl_payload[2..];
-                                    self.send_close(code, reason);
-                                } else {
-                                    self.send(&.{}, .close);
-                                }
-                                if (self.behavior.close) |cb| cb(self);
-                                tcp.close_connection(self.conn);
-                                return;
-                            }
-                        } else {
-                            if (op != .continuation) {
-                                self.current_opcode = op;
-                            }
-
-                            if (dh.header.fin) {
-                                const final_op = self.current_opcode orelse .text;
-                                const full_msg = if (fast_path) chunk else self.msg_buffer.items;
-
-                                if (final_op == .text and !std.unicode.utf8ValidateSlice(full_msg)) {
-                                    self.send_close(1007, "Invalid UTF-8");
-                                    tcp.close_connection(self.conn);
-                                    return;
-                                }
-
-                                if (self.behavior.message) |cb| cb(self, full_msg, final_op);
-
-                                if (!fast_path) {
-                                    self.msg_buffer.clearRetainingCapacity();
-                                }
-                                self.current_opcode = null;
-                            }
+                    if (opcode.is_control()) {
+                        const start: usize = @intCast(self.z_conn.payload_bytes_processed);
+                        @memcpy(self.control_buffer[start .. start + process_len], chunk);
+                    } else if (self.message_compressed) {
+                        if (!self.append_compressed(chunk)) {
+                            self.fail(1009, "Message too large");
+                            return;
                         }
-                        self.z_conn.complete_frame();
+                    } else if (!fast_path) {
+                        if (!self.append_message(chunk)) {
+                            self.fail(1009, "Message too large");
+                            return;
+                        }
                     }
 
-                    offset += to_process;
+                    self.z_conn.advance_payload_read(process_len_u64) catch {
+                        self.fail(1002, "Protocol error");
+                        return;
+                    };
+                    offset += process_len;
+
+                    if (self.z_conn.payload_bytes_processed != decoded.extended_len) continue;
+                    if (!self.complete_payload_frame(decoded, opcode, chunk, fast_path)) return;
                 },
                 .emit_frame => {
-                    const dh = self.z_conn.decoded_header.?;
-                    const op: zslay.Opcode = @enumFromInt(dh.header.opcode);
-
-                    if (op == .ping) {
-                        self.send(&.{}, .pong);
-                    } else if (op == .close) {
-                        self.send(&.{}, .close);
-                        if (self.behavior.close) |cb| cb(self);
-                        tcp.close_connection(self.conn);
+                    const decoded = self.z_conn.decoded_header orelse {
+                        self.fail(1002, "Protocol error");
                         return;
-                    } else if (op == .text or op == .binary or op == .continuation) {
-                        if (op != .continuation) {
-                            self.current_opcode = op;
-                        }
-                        if (dh.header.fin) {
-                            const final_op = self.current_opcode orelse .text;
-                            if (self.behavior.message) |cb| cb(self, self.msg_buffer.items, final_op);
-                            self.msg_buffer.clearRetainingCapacity();
-                            self.current_opcode = null;
-                        }
-                    }
-                    self.z_conn.complete_frame();
+                    };
+                    const opcode: zslay.Opcode = @enumFromInt(decoded.header.opcode);
+                    if (!self.validate_frame_compression(opcode)) return;
+                    if (!self.complete_empty_frame(decoded, opcode)) return;
                 },
                 else => unreachable,
             }
         }
     }
 
+    fn complete_payload_frame(
+        self: *WebSocket,
+        decoded: zslay.DecodedHeader,
+        opcode: zslay.Opcode,
+        final_chunk: []const u8,
+        fast_path: bool,
+    ) bool {
+        if (opcode.is_control()) {
+            const payload_len: usize = @intCast(decoded.extended_len);
+            const payload = self.control_buffer[0..payload_len];
+            if (!self.handle_control(opcode, payload)) return false;
+            self.complete_frame();
+            return !self.conn.closing and !self.conn.close_when_drained;
+        }
+
+        if (opcode != .continuation) self.current_opcode = opcode;
+        if (!decoded.header.fin) {
+            self.complete_frame();
+            return true;
+        }
+
+        const message_opcode = self.current_opcode orelse {
+            self.fail(1002, "Protocol error");
+            return false;
+        };
+        const message = if (self.message_compressed)
+            self.decompress_message() orelse return false
+        else if (fast_path)
+            final_chunk
+        else
+            self.conn.ws_message_buffer[0..self.message_len];
+        if (!self.validate_complete_text(message_opcode, message)) return false;
+
+        if (self.behavior.message) |callback| callback(self, message, message_opcode);
+        self.reset_message();
+        self.complete_frame();
+        return !self.conn.closing and !self.conn.close_when_drained;
+    }
+
+    fn complete_empty_frame(
+        self: *WebSocket,
+        decoded: zslay.DecodedHeader,
+        opcode: zslay.Opcode,
+    ) bool {
+        if (opcode.is_control()) {
+            if (!self.handle_control(opcode, "")) return false;
+            self.complete_frame();
+            return !self.conn.closing and !self.conn.close_when_drained;
+        }
+
+        if (opcode != .continuation) {
+            self.current_opcode = opcode;
+            self.utf8_state = .{};
+        }
+        if (decoded.header.fin) {
+            const message_opcode = self.current_opcode orelse {
+                self.fail(1002, "Protocol error");
+                return false;
+            };
+            const message = if (self.message_compressed)
+                self.decompress_message() orelse return false
+            else
+                self.conn.ws_message_buffer[0..self.message_len];
+            if (!self.validate_complete_text(message_opcode, message)) return false;
+            if (self.behavior.message) |callback| callback(self, message, message_opcode);
+            self.reset_message();
+        }
+
+        self.complete_frame();
+        return !self.conn.closing and !self.conn.close_when_drained;
+    }
+
+    fn append_message(self: *WebSocket, chunk: []const u8) bool {
+        const limit: usize = @intCast(self.behavior.max_message_size);
+        if (self.message_len > limit) return false;
+        if (chunk.len > limit - self.message_len) return false;
+
+        std.mem.copyForwards(
+            u8,
+            self.conn.ws_message_buffer[self.message_len .. self.message_len + chunk.len],
+            chunk,
+        );
+        self.message_len += chunk.len;
+        return true;
+    }
+
+    fn append_compressed(self: *WebSocket, chunk: []const u8) bool {
+        const buffer = self.conn.ws_compression_buffer;
+        if (buffer.len < deflate.decode_tail_len) return false;
+        const limit = buffer.len - deflate.decode_tail_len;
+        if (self.compressed_len > limit) return false;
+        if (chunk.len > limit - self.compressed_len) return false;
+
+        @memcpy(
+            buffer[self.compressed_len .. self.compressed_len + chunk.len],
+            chunk,
+        );
+        self.compressed_len += chunk.len;
+        return true;
+    }
+
+    fn decompress_message(self: *WebSocket) ?[]const u8 {
+        const context = self.conn.ws_deflate orelse {
+            self.fail(1002, "Compression unavailable");
+            return null;
+        };
+        const limit: usize = @intCast(self.behavior.max_message_size);
+        const output = self.conn.ws_message_buffer[0..limit];
+        return context.decompress_message(
+            self.conn.ws_compression_buffer[0..self.compressed_len],
+            self.conn.ws_compression_buffer,
+            output,
+        ) catch |err| {
+            const code: u16 = if (err == error.OutputTooLarge) 1009 else 1007;
+            self.fail(code, if (code == 1009) "Message too large" else "Invalid compressed data");
+            return null;
+        };
+    }
+
+    fn validate_complete_text(
+        self: *WebSocket,
+        opcode: zslay.Opcode,
+        message: []const u8,
+    ) bool {
+        if (opcode != .text) return true;
+        const valid = if (self.message_compressed)
+            std.unicode.utf8ValidateSlice(message)
+        else
+            utf8.is_complete(self.utf8_state);
+        if (valid) return true;
+
+        self.fail(1007, "Invalid UTF-8");
+        return false;
+    }
+
+    fn validate_frame_compression(self: *WebSocket, opcode: zslay.Opcode) bool {
+        if (self.frame_compression_checked) return true;
+        self.frame_compression_checked = true;
+
+        if (opcode.is_control() or opcode == .continuation) {
+            if (!self.frame_rsv1) return true;
+            self.fail(1002, "Protocol error");
+            return false;
+        }
+
+        if (self.frame_rsv1 and self.permessage_deflate == null) {
+            self.fail(1002, "Protocol error");
+            return false;
+        }
+        self.message_compressed = self.frame_rsv1;
+        self.compressed_len = 0;
+        return true;
+    }
+
+    fn complete_frame(self: *WebSocket) void {
+        self.z_conn.complete_frame();
+        self.frame_rsv1 = false;
+        self.frame_compression_checked = false;
+    }
+
+    fn reset_message(self: *WebSocket) void {
+        self.message_len = 0;
+        self.compressed_len = 0;
+        self.current_opcode = null;
+        self.utf8_state = .{};
+        self.message_compressed = false;
+    }
+
+    fn handle_control(self: *WebSocket, opcode: zslay.Opcode, payload: []const u8) bool {
+        switch (opcode) {
+            .ping => self.send(payload, .pong) catch {
+                tcp.close_connection(self.conn);
+                return false;
+            },
+            .pong => {},
+            .close => {
+                switch (close_payload_status(payload)) {
+                    .valid => {},
+                    .protocol_error => {
+                        self.fail(1002, "Invalid close frame");
+                        return false;
+                    },
+                    .invalid_utf8 => {
+                        self.fail(1007, "Invalid UTF-8");
+                        return false;
+                    },
+                }
+
+                self.close_received = true;
+                if (!self.close_sent) {
+                    self.send(payload, .close) catch {
+                        tcp.close_connection(self.conn);
+                        return false;
+                    };
+                }
+                self.notify_close();
+                tcp.close_after_flush(self.conn);
+                return false;
+            },
+            else => {
+                self.fail(1002, "Protocol error");
+                return false;
+            },
+        }
+        return true;
+    }
+
+    fn fail(self: *WebSocket, code: u16, reason: []const u8) void {
+        self.send_close(code, reason) catch {
+            tcp.close_connection(self.conn);
+            return;
+        };
+        self.notify_close();
+        tcp.close_after_flush(self.conn);
+    }
+
+    fn notify_close(self: *WebSocket) void {
+        if (self.close_notified) return;
+        self.close_notified = true;
+        if (self.behavior.close) |callback| callback(self);
+    }
+
+    pub fn notify_drain(self: *WebSocket) void {
+        if (!self.initialized or self.conn.closing) return;
+        if (self.behavior.drain) |callback| callback(self);
+    }
+
+    pub fn terminate(self: *WebSocket) void {
+        tcp.close_connection(self.conn);
+    }
+
     pub fn deinit(self: *WebSocket) void {
-        self.msg_buffer.deinit(std.heap.c_allocator);
+        if (!self.initialized) return;
+        self.notify_close();
+        if (self.pubsub) |engine| engine.unsubscribe_all(self);
+        self.initialized = false;
+        self.reset_message();
+        self.permessage_deflate = null;
+        self.frame_rsv1 = false;
+        self.frame_compression_checked = false;
     }
 
-    // registers this client into a pub/sub topic
     pub fn subscribe(self: *WebSocket, topic: []const u8) !void {
-        if (self.pubsub) |ps| {
-            try ps.subscribe(self, topic);
-        }
+        const engine = self.pubsub orelse return error.PubSubUnavailable;
+        try engine.subscribe(self, topic);
     }
 
-    // broadcasts a message to a topic from this client
-    pub fn publish(self: *WebSocket, topic: []const u8, message: []const u8, is_text: bool) void {
-        if (self.pubsub) |ps| {
-            ps.publish(topic, message, is_text);
-        }
+    pub fn unsubscribe(self: *WebSocket, topic: []const u8) bool {
+        const engine = self.pubsub orelse return false;
+        return engine.unsubscribe(self, topic);
+    }
+
+    pub fn publish(self: *WebSocket, topic: []const u8, message: []const u8, is_text: bool) usize {
+        const engine = self.pubsub orelse return 0;
+        return engine.publish(topic, message, is_text);
     }
 };
+
+fn negotiate_permessage_deflate(req: *const Request) ?handshake.PerMessageDeflate {
+    for (req.header_names[0..req.header_count], req.header_values[0..req.header_count]) |name, value| {
+        if (!std.ascii.eqlIgnoreCase(name, "Sec-WebSocket-Extensions")) continue;
+        if (handshake.negotiate_permessage_deflate(value)) |negotiated| return negotiated;
+    }
+    return null;
+}
+
+fn validate_outgoing_payload(data: []const u8, opcode: zslay.Opcode) !void {
+    switch (opcode) {
+        .continuation => return error.InvalidOpcode,
+        .text => if (!std.unicode.utf8ValidateSlice(data)) return error.InvalidUtf8,
+        .close => switch (close_payload_status(data)) {
+            .valid => {},
+            .protocol_error => return error.InvalidCloseFrame,
+            .invalid_utf8 => return error.InvalidUtf8,
+        },
+        .ping, .pong => if (data.len > 125) return error.ControlFrameTooLarge,
+        .binary => {},
+        else => return error.InvalidOpcode,
+    }
+}
+
+fn unique_header(req: *const Request, name: []const u8) ?[]const u8 {
+    var value: ?[]const u8 = null;
+    for (req.header_names[0..req.header_count], req.header_values[0..req.header_count]) |header_name, header_value| {
+        if (!std.ascii.eqlIgnoreCase(header_name, name)) continue;
+        if (value != null) return null;
+        value = header_value;
+    }
+    return value;
+}
+
+fn reject_upgrade(
+    response: *Response,
+    conn: *TcpConnection,
+    status: []const u8,
+    body: []const u8,
+    advertise_version: bool,
+) void {
+    const headers = if (advertise_version)
+        "Sec-WebSocket-Version: 13\r\nConnection: close\r\n"
+    else
+        "Connection: close\r\n";
+
+    response.end_with_headers(status, headers, body) catch {
+        tcp.close_connection(conn);
+        return;
+    };
+    tcp.close_after_flush(conn);
+}
+
+const ClosePayloadStatus = enum {
+    valid,
+    protocol_error,
+    invalid_utf8,
+};
+
+fn close_payload_status(payload: []const u8) ClosePayloadStatus {
+    if (payload.len == 0) return .valid;
+    if (payload.len == 1 or payload.len > 125) return .protocol_error;
+
+    const code = std.mem.readInt(u16, payload[0..2], .big);
+    if (!valid_close_code(code)) return .protocol_error;
+    if (!std.unicode.utf8ValidateSlice(payload[2..])) return .invalid_utf8;
+    return .valid;
+}
+
+fn valid_close_code(code: u16) bool {
+    return switch (code) {
+        1000...1003, 1007...1014, 3000...4999 => true,
+        else => false,
+    };
+}
+
+test "websocket validates outgoing application frames" {
+    try validate_outgoing_payload("valid", .text);
+    try validate_outgoing_payload("", .close);
+    try std.testing.expectError(
+        error.InvalidUtf8,
+        validate_outgoing_payload(&.{ 0xc0, 0x80 }, .text),
+    );
+    try std.testing.expectError(
+        error.InvalidOpcode,
+        validate_outgoing_payload("", .continuation),
+    );
+    try std.testing.expectError(
+        error.InvalidCloseFrame,
+        validate_outgoing_payload(&.{0x03}, .close),
+    );
+    try std.testing.expectError(
+        error.InvalidUtf8,
+        validate_outgoing_payload(&.{ 0x03, 0xe8, 0xc0, 0x80 }, .close),
+    );
+    try std.testing.expectError(
+        error.ControlFrameTooLarge,
+        validate_outgoing_payload(&([_]u8{0} ** 126), .ping),
+    );
+}

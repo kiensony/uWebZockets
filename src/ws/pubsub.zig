@@ -2,69 +2,146 @@ const std = @import("std");
 const WebSocket = @import("socket.zig").WebSocket;
 const zslay = @import("zslay");
 
-// static limits for the pub/sub system
-const max_topics = 1024;
-const max_subscriptions = 8192;
+pub const max_topics = 1024;
+pub const max_subscriptions = 8192;
+pub const max_topic_length = 127;
 
-// static pub/sub engine using struct of arrays (soa) for data locality and cpu caching
 pub const PubSubEngine = struct {
-    // topic data
-    topic_names: [max_topics][]const u8 = undefined,
-    topic_subscriber_counts: [max_topics]usize = undefined,
-    topic_count: usize = 0,
-
-    // subscription data
+    topic_names: [max_topics][max_topic_length]u8 = undefined,
+    topic_name_lengths: [max_topics]u8 = .{0} ** max_topics,
+    topic_subscriber_counts: [max_topics]u16 = .{0} ** max_topics,
     sub_sockets: [max_subscriptions]*WebSocket = undefined,
-    sub_topic_ids: [max_subscriptions]usize = undefined,
+    sub_topic_ids: [max_subscriptions]u16 = undefined,
+    topic_count: usize = 0,
     sub_count: usize = 0,
 
-    // finds or allocates a new topic
-    fn get_or_create_topic(self: *PubSubEngine, name: []const u8) !usize {
-        for (self.topic_names[0..self.topic_count], 0..) |topic_name, i| {
-            if (std.mem.eql(u8, topic_name, name)) return i;
+    fn topic_name(self: *const PubSubEngine, topic_id: usize) []const u8 {
+        return self.topic_names[topic_id][0..self.topic_name_lengths[topic_id]];
+    }
+
+    fn find_topic(self: *const PubSubEngine, name: []const u8) ?usize {
+        for (0..self.topic_count) |topic_id| {
+            if (std.mem.eql(u8, self.topic_name(topic_id), name)) return topic_id;
         }
+        return null;
+    }
 
-        if (self.topic_count >= max_topics) return error.OutOfMemory;
+    fn get_or_create_topic(self: *PubSubEngine, name: []const u8) !usize {
+        if (self.find_topic(name)) |topic_id| return topic_id;
+        if (name.len == 0) return error.EmptyTopic;
+        if (name.len > max_topic_length) return error.TopicTooLong;
+        if (self.topic_count >= max_topics) return error.TopicCapacityReached;
 
-        const id = self.topic_count;
-        self.topic_names[id] = name;
-        self.topic_subscriber_counts[id] = 0;
+        const topic_id = self.topic_count;
+        @memcpy(self.topic_names[topic_id][0..name.len], name);
+        self.topic_name_lengths[topic_id] = @intCast(name.len);
+        self.topic_subscriber_counts[topic_id] = 0;
         self.topic_count += 1;
-        return id;
+        return topic_id;
     }
 
-    // registers a client to a topic
-    pub fn subscribe(self: *PubSubEngine, ws: *WebSocket, topic_name: []const u8) !void {
-        if (self.sub_count >= max_subscriptions) return error.OutOfMemory;
+    pub fn subscribe(self: *PubSubEngine, socket: *WebSocket, topic: []const u8) !void {
+        const existing_topic_id = self.find_topic(topic);
 
-        const tid = try self.get_or_create_topic(topic_name);
-        const sid = self.sub_count;
-
-        self.sub_sockets[sid] = ws;
-        self.sub_topic_ids[sid] = tid;
-        self.sub_count += 1;
-
-        self.topic_subscriber_counts[tid] += 1;
-    }
-
-    // broadcasts a message to all clients in a topic
-    pub fn publish(self: *PubSubEngine, topic_name: []const u8, message: []const u8, is_text: bool) void {
-        var target_tid: ?usize = null;
-        for (self.topic_names[0..self.topic_count], 0..) |t_name, i| {
-            if (std.mem.eql(u8, t_name, topic_name)) {
-                target_tid = i;
-                break;
+        if (existing_topic_id) |topic_id| {
+            for (0..self.sub_count) |subscription_id| {
+                if (self.sub_sockets[subscription_id] == socket and
+                    self.sub_topic_ids[subscription_id] == topic_id)
+                {
+                    return;
+                }
             }
         }
 
-        const tid = target_tid orelse return;
-        const opcode: zslay.Opcode = if (is_text) .text else .binary;
-        const active_ids = self.sub_topic_ids[0..self.sub_count];
+        if (self.sub_count >= max_subscriptions) return error.SubscriptionCapacityReached;
+        const topic_id = existing_topic_id orelse try self.get_or_create_topic(topic);
+        if (self.topic_subscriber_counts[topic_id] == std.math.maxInt(u16)) {
+            return error.TopicSubscriberCapacityReached;
+        }
 
-        // linear scan over contiguous memory; llvm will auto-vectorize this loop
-        for (active_ids, 0..) |id, i| {
-            if (id == tid) {
-                self.sub_sockets[i].send(message, opcode);
+        self.sub_sockets[self.sub_count] = socket;
+        self.sub_topic_ids[self.sub_count] = @intCast(topic_id);
+        self.sub_count += 1;
+        self.topic_subscriber_counts[topic_id] += 1;
+    }
+
+    pub fn unsubscribe(self: *PubSubEngine, socket: *WebSocket, topic: []const u8) bool {
+        const topic_id = self.find_topic(topic) orelse return false;
+
+        for (0..self.sub_count) |subscription_id| {
+            if (self.sub_sockets[subscription_id] != socket) continue;
+            if (self.sub_topic_ids[subscription_id] != topic_id) continue;
+
+            self.remove_subscription(subscription_id);
+            if (self.topic_subscriber_counts[topic_id] == 0) self.remove_topic(topic_id);
+            return true;
+        }
+        return false;
+    }
+
+    pub fn unsubscribe_all(self: *PubSubEngine, socket: *WebSocket) void {
+        var subscription_id: usize = 0;
+        while (subscription_id < self.sub_count) {
+            if (self.sub_sockets[subscription_id] != socket) {
+                subscription_id += 1;
+                continue;
+            }
+            self.remove_subscription(subscription_id);
+        }
+
+        var topic_id: usize = 0;
+        while (topic_id < self.topic_count) {
+            if (self.topic_subscriber_counts[topic_id] != 0) {
+                topic_id += 1;
+                continue;
+            }
+            self.remove_topic(topic_id);
+        }
+    }
+
+    pub fn publish(self: *PubSubEngine, topic: []const u8, message: []const u8, is_text: bool) usize {
+        const topic_id = self.find_topic(topic) orelse return 0;
+        const opcode: zslay.Opcode = if (is_text) .text else .binary;
+        var delivered: usize = 0;
+
+        for (0..self.sub_count) |subscription_id| {
+            if (self.sub_topic_ids[subscription_id] != topic_id) continue;
+            // A slow subscriber must not block delivery to bounded peers.
+            self.sub_sockets[subscription_id].send(message, opcode) catch continue;
+            delivered += 1;
+        }
+        return delivered;
+    }
+
+    fn remove_subscription(self: *PubSubEngine, subscription_id: usize) void {
+        const topic_id = self.sub_topic_ids[subscription_id];
+        self.topic_subscriber_counts[topic_id] -= 1;
+
+        self.sub_count -= 1;
+        if (subscription_id == self.sub_count) return;
+        self.sub_sockets[subscription_id] = self.sub_sockets[self.sub_count];
+        self.sub_topic_ids[subscription_id] = self.sub_topic_ids[self.sub_count];
+    }
+
+    fn remove_topic(self: *PubSubEngine, topic_id: usize) void {
+        std.debug.assert(self.topic_subscriber_counts[topic_id] == 0);
+
+        self.topic_count -= 1;
+        if (topic_id == self.topic_count) {
+            self.topic_name_lengths[topic_id] = 0;
+            return;
+        }
+
+        const moved_topic_id = self.topic_count;
+        const moved_name = self.topic_name(moved_topic_id);
+        @memcpy(self.topic_names[topic_id][0..moved_name.len], moved_name);
+        self.topic_name_lengths[topic_id] = self.topic_name_lengths[moved_topic_id];
+        self.topic_subscriber_counts[topic_id] = self.topic_subscriber_counts[moved_topic_id];
+        self.topic_name_lengths[moved_topic_id] = 0;
+
+        for (self.sub_topic_ids[0..self.sub_count]) |*subscription_topic_id| {
+            if (subscription_topic_id.* == moved_topic_id) {
+                subscription_topic_id.* = @intCast(topic_id);
             }
         }
     }

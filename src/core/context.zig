@@ -3,6 +3,12 @@ const std = @import("std");
 // a generic fixed-size memory pool using a bitset.
 // excellent for scenarios where you need to check if a specific index is active in o(1) time.
 pub fn bitset_pool(comptime T: type, comptime capacity: usize) type {
+    if (capacity == 0) @compileError("pool capacity must be greater than zero");
+    if (@sizeOf(T) == 0) @compileError("pool element type must have non-zero size");
+    if (capacity > std.math.maxInt(usize) / @sizeOf(T)) {
+        @compileError("pool storage size overflows usize");
+    }
+
     return struct {
         const Self = @This();
 
@@ -26,15 +32,20 @@ pub fn bitset_pool(comptime T: type, comptime capacity: usize) type {
         }
 
         // releases an active slot back into the pool.
-        pub fn release(self: *Self, item: *const T) void {
+        pub fn release(self: *Self, item: *const T) bool {
             const ptr_int = @intFromPtr(item);
             const base_int = @intFromPtr(&self.storage[0]);
             const element_size = @sizeOf(T);
+            const end_int = base_int + element_size * capacity;
 
-            // compute the index using pointer arithmetic without bounds branching.
-            const index = (ptr_int - base_int) / element_size;
-            if (index >= capacity) return;
+            if (ptr_int < base_int or ptr_int >= end_int) return false;
+            const offset = ptr_int - base_int;
+            if (offset % element_size != 0) return false;
+
+            const index = offset / element_size;
+            if (self.available_mask.isSet(index)) return false;
             self.available_mask.set(index);
+            return true;
         }
 
         // returns the current number of active items.
