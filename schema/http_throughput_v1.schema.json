@@ -1,0 +1,191 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/farbenbuilds/uWebZockets/main/benchmarks/http_throughput_v1.schema.json",
+  "title": "uWebZockets HTTP throughput benchmark record v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "benchmark_id",
+    "record_id",
+    "recorded_at",
+    "guarantee",
+    "methodology",
+    "provenance",
+    "runner",
+    "toolchain",
+    "results"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "benchmark_id": {
+      "const": "http-throughput-v1"
+    },
+    "record_id": {
+      "type": "string",
+      "pattern": "^[0-9]+-[0-9]+-[0-9a-f]{12}$"
+    },
+    "recorded_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "guarantee": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["formula", "minimum_baseline_ratio", "threshold_rps", "passed"],
+      "properties": {
+        "formula": {
+          "const": "candidate_median_rps >= baseline_median_rps * minimum_baseline_ratio"
+        },
+        "minimum_baseline_ratio": {
+          "const": 0.9
+        },
+        "threshold_rps": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "passed": {
+          "type": "boolean"
+        }
+      }
+    },
+    "methodology": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_sha256",
+        "build_optimize",
+        "server_binary",
+        "execution_order",
+        "wrk"
+      ],
+      "properties": {
+        "contract_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "build_optimize": {
+          "const": "ReleaseFast"
+        },
+        "server_binary": {
+          "const": "hello_world"
+        },
+        "execution_order": {
+          "type": "array",
+          "prefixItems": [
+            { "const": "candidate" },
+            { "const": "baseline" }
+          ],
+          "items": false,
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "wrk": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "threads",
+            "connections",
+            "duration_seconds",
+            "samples",
+            "statistic",
+            "target_url"
+          ],
+          "properties": {
+            "threads": { "const": 2 },
+            "connections": { "const": 64 },
+            "duration_seconds": { "const": 10 },
+            "samples": { "const": 3 },
+            "statistic": { "const": "median" },
+            "target_url": { "const": "http://127.0.0.1:3000/" }
+          }
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "event_name",
+        "git_ref",
+        "candidate_sha",
+        "baseline_sha",
+        "candidate_flake_lock_sha256",
+        "baseline_flake_lock_sha256",
+        "workflow_run_url",
+        "run_id",
+        "run_attempt"
+      ],
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "event_name": { "type": "string", "minLength": 1 },
+        "git_ref": { "type": "string", "minLength": 1 },
+        "candidate_sha": { "type": "string", "pattern": "^[0-9a-f]{40,64}$" },
+        "baseline_sha": { "type": "string", "pattern": "^[0-9a-f]{40,64}$" },
+        "candidate_flake_lock_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "baseline_flake_lock_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "workflow_run_url": { "type": "string", "format": "uri" },
+        "run_id": { "type": "integer", "minimum": 1 },
+        "run_attempt": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "runner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["os", "architecture", "name", "image", "cpu_model", "kernel"],
+      "properties": {
+        "os": { "type": "string", "minLength": 1 },
+        "architecture": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "image": { "type": "string", "minLength": 1 },
+        "cpu_model": { "type": "string", "minLength": 1 },
+        "kernel": { "type": "string", "minLength": 1 }
+      }
+    },
+    "toolchain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["zig_version", "nix_version", "wrk_version"],
+      "properties": {
+        "zig_version": { "type": "string", "minLength": 1 },
+        "nix_version": { "type": "string", "minLength": 1 },
+        "wrk_version": { "type": "string", "minLength": 1 }
+      }
+    },
+    "results": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidate", "baseline", "candidate_to_baseline_ratio"],
+      "properties": {
+        "candidate": { "$ref": "#/$defs/result" },
+        "baseline": { "$ref": "#/$defs/result" },
+        "candidate_to_baseline_ratio": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
+      }
+    }
+  },
+  "$defs": {
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["samples_rps", "median_rps"],
+      "properties": {
+        "samples_rps": {
+          "type": "array",
+          "items": { "type": "number", "exclusiveMinimum": 0 },
+          "minItems": 3,
+          "maxItems": 3
+        },
+        "median_rps": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
+      }
+    }
+  }
+}
