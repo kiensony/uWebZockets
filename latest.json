@@ -4,7 +4,7 @@
     "formula": "candidate_median_rps >= baseline_median_rps * minimum_baseline_ratio",
     "minimum_baseline_ratio": 0.9,
     "passed": true,
-    "threshold_rps": 201118.977
+    "threshold_rps": 204154.344
   },
   "methodology": {
     "build_optimize": "ReleaseFast",
@@ -32,36 +32,36 @@
     "git_ref": "refs/heads/main",
     "repository": "kiensony/uWebZockets",
     "run_attempt": 1,
-    "run_id": 45617027420,
-    "workflow_run_url": "https://github.com/kiensony/uWebZockets/actions/runs/45617027420"
+    "run_id": 45819077465,
+    "workflow_run_url": "https://github.com/kiensony/uWebZockets/actions/runs/45819077465"
   },
-  "record_id": "45617027420-1-93f6a3a29103",
-  "recorded_at": "2026-11-25T12:57:06Z",
+  "record_id": "45819077465-1-93f6a3a29103",
+  "recorded_at": "2026-11-26T12:33:03Z",
   "results": {
     "baseline": {
-      "median_rps": 223465.53,
+      "median_rps": 226838.16,
       "samples_rps": [
-        223222.37,
-        223465.53,
-        224513.65
+        222633.77,
+        226838.16,
+        228220.87
       ]
     },
     "candidate": {
-      "median_rps": 223304.41,
+      "median_rps": 228151.53,
       "samples_rps": [
-        223304.41,
-        223188.74,
-        224768.26
+        228556.33,
+        228151.53,
+        225287.4
       ]
     },
-    "candidate_to_baseline_ratio": 0.9992789939459567
+    "candidate_to_baseline_ratio": 1.005789898842417
   },
   "runner": {
     "architecture": "X64",
     "cpu_model": "Intel(R) Xeon(R) 6975P-C",
     "image": "ubuntu24/20261116.133.1",
     "kernel": "Linux 7.0.0-1014-aws #14~24.04.1-Ubuntu SMP PREEMPT Fri Sep 18 21:24:59 UTC 2026 x86_64 GNU/Linux",
-    "name": "GitHub Actions 1000001498",
+    "name": "GitHub Actions 1000001513",
     "os": "Linux"
   },
   "schema_version": 1,
